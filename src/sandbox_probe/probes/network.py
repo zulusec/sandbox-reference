@@ -1,27 +1,37 @@
 """Invariant 1: no ambient network, and the broker is not a trusted zone.
 
-Three questions, not one. Can the sandbox reach something it should not.
-Can it resolve names, which is the exfiltration path an HTTP allowlist never
-sees. And can it reach the classes of host that serve as staging and
-command-and-control, which are the hosts an allowlist tends to contain
-because they look like developer infrastructure.
+Four questions, not one, and the first one is the one that cannot be
+dodged. Can the sandbox open a TCP connection to a bare address literal.
+That question needs no name resolution, so there is no state of the world in
+which it silently fails to run: either the connection opened, or the route
+was denied, and both of those are measurements. It is the check that carries
+this invariant.
 
-The positive control is the fourth, and in a correctly contained sandbox it
-cannot be direct reachability of the allowed host, because nothing is
-directly reachable. That is the whole point of containment: the reference
-sandbox sits on a network with no route out, and its only path is an egress
-broker. So when the target names a proxy, the control goes through it,
-asking for the allowed host in absolute-URI form and accepting any answer
-that is not an outright denial (the reference broker forwards nothing; it
-answers 403 for a denied host and 502 for an allowed one, and 502 is exactly
-the proof of life and policy the control needs). A target with no proxy
-falls back to direct reachability or resolvability of the allowed host,
-which is what a genuinely open target (the leaky fixture) can prove.
+The other three are name-based, and every name-based check has a failure
+mode the first one does not. Can the sandbox reach a host it should not, can
+it resolve a name at all, which is the exfiltration path an HTTP allowlist
+never sees, and can it reach the classes of host that serve as staging and
+command-and-control. A name that does not resolve makes all three fail for a
+reason that has nothing to do with containment, which is why each of them
+reports why it did not fire rather than reporting a bare no.
 
-Either way, a sandbox with no network at all answers no to the first three
-questions for a reason that has nothing to do with containment, and a
-harness that cannot tell that apart from a properly contained sandbox is
-measuring nothing.
+The positive control is the fourth kind of question, and in a correctly
+contained sandbox it cannot be direct reachability of the allowed host,
+because nothing is directly reachable. That is the whole point of
+containment: the reference sandbox sits on a network with no route out, and
+its only path is an egress broker. So when the target names a proxy, the
+control goes through it, asking for the allowed host in absolute-URI form
+and accepting any answer that is not an outright denial (the reference
+broker forwards nothing; it answers 403 for a denied host and 502 for an
+allowed one, and 502 is exactly the proof of life and policy the control
+needs). A target with no proxy falls back to direct reachability or
+resolvability of the allowed host, which is what a genuinely open target
+(the leaky fixture) can prove.
+
+Either way, a sandbox with no network at all answers no to every question
+for a reason that has nothing to do with containment, and a harness that
+cannot tell that apart from a properly contained sandbox is measuring
+nothing.
 """
 
 from __future__ import annotations
@@ -35,27 +45,42 @@ from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
 
+# The two answers the address-literal check is allowed to give. Anything
+# else means it did not run.
+_MEASURED = ("connected", "denied")
+
 PAYLOAD_BODY = """
 def reachable(host, port=80, timeout=3):
+    # Three answers, not two. The old two-answer version caught OSError and
+    # returned False, which made 'the name does not exist' and 'the route
+    # was denied' the same answer. Only the second one is a measurement of
+    # containment, and collapsing them is how a harness certifies a sandbox
+    # with unrestricted egress as contained: every name it was told to try
+    # happened to be one that resolves for nobody.
+    #
+    # socket.gaierror is a subclass of OSError, so it has to be caught first.
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
+            return 'connected'
+    except socket.gaierror:
+        return 'unresolved'
     except OSError:
-        return False
+        return 'denied'
 
 def resolves(host):
     try:
         socket.getaddrinfo(host, None)
-        return True
+        return 'resolved'
     except OSError:
-        return False
+        return 'unresolved'
 
-def parse_proxy(value):
+def parse_host_port(value):
     # 'host:port', or '[ipv6]:port' the way the reference broker's own
-    # host_of parses IPv6 literals. No default port: a proxy value is
-    # always 'host:port' by contract, and guessing a port for a malformed
-    # value would silently connect to the wrong service instead of failing
-    # closed for a reason the target config can be fixed to address.
+    # host_of parses IPv6 literals. No default port: a proxy or endpoint
+    # value is always 'host:port' by contract, and guessing a port for a
+    # malformed value would silently connect to the wrong service instead
+    # of failing closed for a reason the target config can be fixed to
+    # address.
     if value.startswith('['):
         host, _, rest = value[1:].partition(']')
         port_text = rest[1:] if rest.startswith(':') else ''
@@ -64,6 +89,20 @@ def parse_proxy(value):
         if not sep:
             host, port_text = value, ''
     return host, int(port_text)
+
+def endpoint_status(value, timeout=3):
+    # The address literal. The config validator guarantees this is an
+    # address and a port, so create_connection performs no name lookup and
+    # the answer is about the route and nothing else.
+    #
+    # 'unattempted' rather than 'denied' when the value will not parse: a
+    # value the payload could not use is a check that did not run, and the
+    # probe turns that into an error rather than a clean line.
+    try:
+        host, port = parse_host_port(value)
+    except (ValueError, AttributeError):
+        return 'unattempted'
+    return reachable(host, port, timeout)
 
 def proxy_allows(proxy, allowed_host, timeout=3):
     # Open the proxy and ask for allowed_host in absolute-URI form, the way
@@ -83,7 +122,7 @@ def proxy_allows(proxy, allowed_host, timeout=3):
     # fails closed rather than raising past the caller and losing the
     # rest of this payload's measurements.
     try:
-        proxy_host, proxy_port = parse_proxy(proxy)
+        proxy_host, proxy_port = parse_host_port(proxy)
         with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock:
             sock.sendall(('GET http://' + allowed_host + '/ HTTP/1.0\\r\\n\\r\\n').encode())
             sock.settimeout(timeout)
@@ -101,23 +140,29 @@ def proxy_allows(proxy, allowed_host, timeout=3):
         return False
 
 blocked = os.environ['PROBE_BLOCKED_HOST']
+endpoint = os.environ['PROBE_BLOCKED_ENDPOINT']
+canary = os.environ['PROBE_DNS_CANARY_HOST']
 allowed = os.environ['PROBE_ALLOWED_HOST']
 c2 = [h for h in os.environ['PROBE_C2_HOSTS'].split(',') if h]
 proxy = os.environ.get('PROBE_PROXY') or None
 
-result['blocked_reachable'] = reachable(blocked)
-result['dns_resolved'] = resolves('canary.' + blocked)
-result['c2_reachable'] = [h for h in c2 if reachable(h)]
+result['blocked_endpoint'] = endpoint_status(endpoint)
+result['blocked_host'] = reachable(blocked)
+result['dns_canary'] = resolves(canary)
+result['c2'] = dict((h, reachable(h)) for h in c2)
 result['control_reachable'] = (
-    proxy_allows(proxy, allowed) if proxy else (reachable(allowed) or resolves(allowed))
+    proxy_allows(proxy, allowed) if proxy else (
+        reachable(allowed) == 'connected' or resolves(allowed) == 'resolved'
+    )
 )
 """
 
 
-def _as_list(value) -> list:
-    """A list, or an empty one. The payload's contract is a list, and a
-    string arriving here must never be walked character by character."""
-    return value if isinstance(value, list) else []
+def _as_mapping(value) -> dict:
+    """A mapping, or an empty one. The payload's contract is an object
+    keyed by hostname, and a string arriving here must never be walked
+    character by character."""
+    return value if isinstance(value, dict) else {}
 
 
 def _exec_failure_detail(base: str, executed: ExecResult) -> str:
@@ -136,22 +181,34 @@ def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     return detail
 
 
+def build_payload(target: Target) -> str:
+    """The inner payload for this target.
+
+    Module level rather than inline in run() so the end-to-end suite can
+    send exactly this payload into a live sandbox and read the raw
+    per-check statuses, which is the only way to show that a clean network
+    result rests on checks that were attempted.
+    """
+    # Direct assignment, not setdefault: the environment inside the sandbox
+    # belongs to the system under test, and a preset PROBE_* name there
+    # must never be allowed to choose what this probe measures instead of
+    # what the target actually specifies.
+    return emit(
+        f"os.environ['PROBE_BLOCKED_HOST'] = {target.blocked_host!r}\n"
+        f"os.environ['PROBE_BLOCKED_ENDPOINT'] = {target.blocked_endpoint!r}\n"
+        f"os.environ['PROBE_DNS_CANARY_HOST'] = {target.dns_canary_host!r}\n"
+        f"os.environ['PROBE_ALLOWED_HOST'] = {target.allowed_host!r}\n"
+        f"os.environ['PROBE_C2_HOSTS'] = {','.join(target.c2_hosts)!r}\n"
+        f"os.environ['PROBE_PROXY'] = {(target.proxy or '')!r}\n"
+        + PAYLOAD_BODY
+    )
+
+
 class NetworkProbe:
     probe_id = "network"
 
     def run(self, target: Target) -> ProbeOutcome:
-        # Direct assignment, not setdefault: the environment inside the sandbox
-        # belongs to the system under test, and a preset PROBE_* name there
-        # must never be allowed to choose what this probe measures instead of
-        # what the target actually specifies.
-        payload = emit(
-            f"os.environ['PROBE_BLOCKED_HOST'] = {target.blocked_host!r}\n"
-            f"os.environ['PROBE_ALLOWED_HOST'] = {target.allowed_host!r}\n"
-            f"os.environ['PROBE_C2_HOSTS'] = {','.join(target.c2_hosts)!r}\n"
-            f"os.environ['PROBE_PROXY'] = {(target.proxy or '')!r}\n"
-            + PAYLOAD_BODY
-        )
-        executed = target.run_inside([payload], timeout=_TIMEOUT)
+        executed = target.run_inside([build_payload(target)], timeout=_TIMEOUT)
         try:
             inner = parse_inner(executed.stdout)
         except InnerProtocolError as error:
@@ -173,34 +230,73 @@ class NetworkProbe:
             )
 
         findings = []
-        if inner.get("blocked_reachable"):
+        errors = []
+
+        # The address literal, first, because it is the check the rest of
+        # this probe leans on. It needs no DNS, so 'connected' means the
+        # sandbox has a route off its own network and 'denied' means it does
+        # not, and there is no third state that quietly means neither.
+        endpoint_status = inner.get("blocked_endpoint")
+        if endpoint_status == "connected":
+            findings.append(Finding(
+                probe_id=self.probe_id, subject=target.name, rule_key="blocked_egress",
+                severity=Severity.HIGH,
+                title="The sandbox has a route to the public internet",
+                evidence=(
+                    f"opened a TCP connection to {target.blocked_endpoint}, an address "
+                    "literal that needs no name resolution. Ambient egress, whatever "
+                    "the allowlist says."
+                ),
+            ))
+        elif endpoint_status not in _MEASURED:
+            errors.append(ProbeError(
+                self.probe_id, target.name, "blocked_endpoint",
+                f"the address-literal reachability check did not run "
+                f"(status {endpoint_status!r} for {target.blocked_endpoint}). "
+                "This is the check that measures raw routability without DNS, "
+                "so nothing else here adds up to a containment result.",
+            ))
+
+        # The name-based reach check. 'unresolved' is not a pass and is not
+        # counted as one: it is a check that measured nothing, and the only
+        # reason it is not an error is that blocked_endpoint above asked the
+        # same question without a name in it and got an answer. Delete that
+        # check and this branch becomes the hole that let a sandbox with
+        # unrestricted egress and working public DNS report CONTAINED.
+        if inner.get("blocked_host") == "connected":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="blocked_egress",
                 severity=Severity.HIGH,
                 title="The sandbox reached a host that is not on the allowlist",
                 evidence=f"opened a TCP connection to {target.blocked_host}:80",
             ))
-        if inner.get("dns_resolved"):
+
+        # Same rule for the canary. It resolves on anything with DNS egress,
+        # so 'resolved' is proof; 'unresolved' is either containment or an
+        # environment with no DNS at all, and the two are indistinguishable
+        # from inside. Unmeasured, therefore never reported as clean.
+        if inner.get("dns_canary") == "resolved":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="dns_canary",
                 severity=Severity.HIGH,
-                title="The sandbox resolved an arbitrary name",
+                title="The sandbox resolved a public name",
                 evidence=(
-                    f"resolved canary.{target.blocked_host}. Name resolution is an "
+                    f"resolved {target.dns_canary_host}. Name resolution is an "
                     "exfiltration channel that an HTTP allowlist does not cover."
                 ),
             ))
+
         # The harness put this host list into the payload, so the harness
         # decides which of them count as answers. Anything else that comes
         # back is a host nobody asked about: it cannot be a measurement of
         # a configured c2 class, and rendering it would let the system under
-        # test write text of its choosing into this report. Intersecting
-        # also fixes the order, which the target would otherwise pick.
-        reported = {
-            host for host in _as_list(inner.get("c2_reachable"))
-            if isinstance(host, str)
-        }
-        confirmed, dropped = bounded([h for h in target.c2_hosts if h in reported])
+        # test write text of its choosing into this report. Reading the
+        # statuses in the config's order also fixes the order, which the
+        # target would otherwise pick.
+        reported = _as_mapping(inner.get("c2"))
+        confirmed, dropped = bounded([
+            host for host in target.c2_hosts if reported.get(host) == "connected"
+        ])
         for host in confirmed:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="c2_channel",
@@ -221,6 +317,7 @@ class NetworkProbe:
 
         return ProbeOutcome(
             findings=findings,
+            errors=errors,
             control_ok=bool(inner.get("control_reachable")),
         )
 
