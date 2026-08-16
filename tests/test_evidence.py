@@ -12,6 +12,7 @@ from sandbox_probe.evidence import (
     COUNT,
     LIST,
     LIST_LIMIT,
+    MAPPING,
     TEXT,
     TEXT_LIMIT,
     InnerShapeError,
@@ -151,6 +152,22 @@ def test_a_negative_count_is_a_problem():
 
 def test_a_string_where_a_list_belongs_is_a_problem():
     assert shape_problem_detail({"paths": "/etc/shadow"}, {"paths": LIST}) is not None
+
+
+def test_a_mapping_keyed_result_can_declare_its_shape():
+    """A payload result keyed by hostname is as much a declared shape as a
+    list is, and a probe that has no way to declare one is left guarding it
+    locally, which is where the silent-discard pattern comes back."""
+    assert shape_problem_detail({"c2": {"paste.invalid": "connected"}},
+                                {"c2": MAPPING}) is None
+    assert shape_problem_detail({"c2": {}}, {"c2": MAPPING}) is None
+
+
+def test_anything_that_is_not_a_mapping_is_a_problem():
+    for wrong in ("connected", ["paste.invalid"], None, 1, True):
+        detail = shape_problem_detail({"c2": wrong}, {"c2": MAPPING})
+        assert detail is not None, wrong
+        assert type(wrong).__name__ in detail, wrong
 
 
 def test_every_problem_is_named_in_a_stable_order():

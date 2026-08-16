@@ -61,6 +61,7 @@ LIST_LIMIT = 16
 BOOL = "a boolean"
 COUNT = "a non-negative whole number"
 LIST = "a list"
+MAPPING = "an object"
 TEXT = "a string"
 
 
@@ -129,6 +130,12 @@ def _has_shape(shape: str, value: object) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value >= 0
     if shape == LIST:
         return isinstance(value, list)
+    if shape == MAPPING:
+        # A result keyed by something the harness put in, a hostname or a
+        # path. Only that the container is an object: which keys count as
+        # answers is the probe's own question, and it settles it by reading
+        # the keys it sent rather than the ones it was sent.
+        return isinstance(value, dict)
     if shape == TEXT:
         return isinstance(value, str)
     raise ValueError(f"no such declared shape: {shape!r}")
