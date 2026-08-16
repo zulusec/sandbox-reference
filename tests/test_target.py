@@ -96,3 +96,14 @@ def test_wallclock_limit_rejects_a_bool(tmp_path):
     with pytest.raises(TargetConfigError) as excinfo:
         load_target(_write(tmp_path, dict(_MINIMAL, wallclock_limit_seconds=True)))
     assert "wallclock_limit_seconds" in str(excinfo.value)
+
+
+def test_non_object_config_is_a_config_error(tmp_path):
+    """A config whose top-level JSON value is not an object must raise
+    TargetConfigError, not escape as a raw AttributeError or TypeError."""
+    path = tmp_path / "target.json"
+    path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(path)
+    assert str(path) in str(excinfo.value)
+    assert "object" in str(excinfo.value)

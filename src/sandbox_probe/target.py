@@ -90,6 +90,9 @@ def load_target(path: str | Path) -> Target:
     except json.JSONDecodeError as error:
         raise TargetConfigError(f"target config at {path} is not valid JSON: {error}") from error
 
+    if not isinstance(raw, dict):
+        raise TargetConfigError(f"target config at {path} must be a JSON object")
+
     for key in _REQUIRED:
         if key not in raw:
             raise TargetConfigError(f"target config is missing required key: {key}")
