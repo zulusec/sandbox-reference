@@ -1,0 +1,15 @@
+{
+  "name": "reference",
+  "exec_command": ["docker", "compose", "-f", "reference/docker-compose.yml",
+                   "exec", "-T", "sandbox", "python3", "-"],
+  "request_log_command": ["docker", "compose", "-f", "reference/docker-compose.yml",
+                          "exec", "-T", "broker", "cat", "/var/log/broker/requests.log"],
+  "events_command": ["docker", "compose", "-f", "reference/docker-compose.yml",
+                     "exec", "-T", "broker", "cat", "/var/log/broker/events.log"],
+  "reset_command": ["docker", "compose", "-f", "reference/docker-compose.yml",
+                    "restart", "sandbox"],
+  "allowed_host": "example.invalid",
+  "blocked_host": "blocked.invalid",
+  "c2_hosts": ["paste.invalid", "requestcapture.invalid", "filedrop.invalid"],
+  "proxy": "broker:3128"
+}

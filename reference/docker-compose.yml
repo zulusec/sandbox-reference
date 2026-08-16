@@ -1,0 +1,38 @@
+services:
+  broker:
+    build: ./broker
+    networks: [contained, egress]
+    volumes:
+      - ./allowlist.json:/etc/broker/allowlist.json:ro
+      - broker-logs:/var/log/broker
+    read_only: true
+    tmpfs: [/tmp]
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  sandbox:
+    image: python:3.12-alpine
+    command: ["sleep", "infinity"]
+    networks: [contained]
+    working_dir: /workspace
+    volumes:
+      - ./workspace:/workspace:rw
+    read_only: true
+    tmpfs: [/tmp]
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+    environment:
+      HTTP_PROXY: "http://broker:3128"
+      HTTPS_PROXY: "http://broker:3128"
+
+networks:
+  contained:
+    internal: true
+  egress: {}
+
+volumes:
+  broker-logs: {}
