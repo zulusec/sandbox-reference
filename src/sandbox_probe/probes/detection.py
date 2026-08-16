@@ -45,11 +45,25 @@ haystack under a different name. The request log delta is read with the
 same before/after discipline as events.log, for the same reason: it is the
 same append-only broker output, and a stale allow-or-deny entry from an
 earlier run would let the check fire, or fail to fire, on data that has
-nothing to do with this run. When the target has no request log configured,
-or this run's window does not show both an allow and a deny, there is
-nothing to compare the event channel against and the check does not run;
-that gap is the attribution probe's no_request_log finding to raise, not
-this one's.
+nothing to do with this run.
+
+When the target has no request log configured at all, this check does not
+run and nothing is reported for it; whether a request log exists is the
+attribution probe's no_request_log finding to raise, not this one's. But
+when a request log is configured and this run's window does not show both
+an allow and a deny (this run's own crossing failed to reach the broker,
+for instance), that is different: the check was supposed to be evaluable
+and was not, so it is surfaced as a ProbeError rather than silently
+skipped. An unmeasured separation check that reads the same as a correctly
+separated one is exactly the false-clean failure mode this project exists
+to rule out.
+
+Findings already proved from the events delta (violation_unalerted,
+severity_understated) are computed before the request log is ever touched
+a second time, and they are returned alongside any request-log-side error
+rather than discarded by it. A probe that throws away a proven HIGH finding
+because a secondary, request-log-backed check failed afterward would be
+trading its entire reason for existing to protect a MEDIUM check.
 """
 
 from __future__ import annotations
@@ -128,8 +142,6 @@ for host in hosts:
         cross_via_proxy(proxy, host)
     else:
         cross_direct(host)
-
-result['attempted'] = hosts
 """
 
 
@@ -268,36 +280,17 @@ class DetectionProbe:
         # violation that this run's payload never actually got alerted.
         events_delta = _parse_lines(events_after_lines[len(events_before_lines):])
 
-        request_delta: list[dict] | None = None
-        if request_configured:
-            request_after = target.read_request_log()
-            if request_after.returncode != 0:
-                return ProbeOutcome(
-                    errors=[ProbeError(
-                        self.probe_id, target.name, "read_request_log",
-                        _exec_failure_detail(
-                            "could not read the request log", request_after,
-                        ),
-                    )],
-                    control_ok=False,
-                )
-            request_after_lines = _lines(request_after.stdout)
-            if len(request_after_lines) < len(request_before_lines):
-                return ProbeOutcome(
-                    errors=[ProbeError(
-                        self.probe_id, target.name, "read_request_log",
-                        f"the request log had {len(request_before_lines)} lines before "
-                        f"this run's violation and only {len(request_after_lines)} after; "
-                        "it appears to have been rotated or truncated, and the channel "
-                        "separation check cannot be evaluated against a log that shrank",
-                    )],
-                    control_ok=False,
-                )
-            request_delta = _parse_lines(request_after_lines[len(request_before_lines):])
-
         blocked = target.blocked_host
         allowed = target.allowed_host
 
+        # These findings are fully proved from the events delta alone, so
+        # they are computed and kept before the request-log delta is ever
+        # touched. channel_not_separated is a secondary, request-log-backed
+        # check; a failure reading the request log below must not discard a
+        # violation_unalerted or severity_understated finding this probe
+        # has already established. An unseen thing is never a pass, but a
+        # seen thing must never be thrown away because something else
+        # afterward could not be seen.
         findings = []
         matching = [event for event in events_delta if event.get("host") == blocked]
         if not matching:
@@ -326,32 +319,89 @@ class DetectionProbe:
                 ),
             ))
 
-        if request_delta is not None:
-            window_has_allow = any(
-                entry.get("host") == allowed and entry.get("decision") == "allow"
-                for entry in request_delta
-            )
-            window_has_deny = any(
-                entry.get("host") == blocked and entry.get("decision") == "deny"
-                for entry in request_delta
-            )
-            channel_carries_allowed = any(
-                event.get("host") == allowed for event in events_delta
-            )
-            if window_has_allow and window_has_deny and channel_carries_allowed:
-                findings.append(Finding(
-                    probe_id=self.probe_id, subject=target.name,
-                    rule_key="channel_not_separated", severity=Severity.MEDIUM,
-                    title="The alert channel is not separated from the request log",
-                    evidence=(
-                        f"this run's window shows an allowed request to {allowed} "
-                        f"and a denied request to {blocked} both went through, and "
-                        f"the event channel carries an entry for {allowed} too. "
-                        "Every request appears on the event channel, so violations "
-                        "are not distinguished from ordinary traffic. That is the "
-                        "same haystack under a different name."
+        if not request_configured:
+            return ProbeOutcome(findings=findings, control_ok=True)
+
+        request_after = target.read_request_log()
+        if request_after.returncode != 0:
+            # The events-side findings above are already proved; they ride
+            # along with the error rather than being discarded because a
+            # secondary, request-log-backed check could not be completed.
+            return ProbeOutcome(
+                findings=findings,
+                errors=[ProbeError(
+                    self.probe_id, target.name, "read_request_log",
+                    _exec_failure_detail(
+                        "could not read the request log", request_after,
                     ),
-                ))
+                )],
+                control_ok=False,
+            )
+        request_after_lines = _lines(request_after.stdout)
+        if len(request_after_lines) < len(request_before_lines):
+            return ProbeOutcome(
+                findings=findings,
+                errors=[ProbeError(
+                    self.probe_id, target.name, "read_request_log",
+                    f"the request log had {len(request_before_lines)} lines before "
+                    f"this run's violation and only {len(request_after_lines)} after; "
+                    "it appears to have been rotated or truncated, and the channel "
+                    "separation check cannot be evaluated against a log that shrank",
+                )],
+                control_ok=False,
+            )
+        request_delta = _parse_lines(request_after_lines[len(request_before_lines):])
+
+        window_has_allow = any(
+            entry.get("host") == allowed and entry.get("decision") == "allow"
+            for entry in request_delta
+        )
+        window_has_deny = any(
+            entry.get("host") == blocked and entry.get("decision") == "deny"
+            for entry in request_delta
+        )
+        if not (window_has_allow and window_has_deny):
+            # The window is incomplete for this check: one or both of this
+            # run's own crossings never made it into the request log, so
+            # there is nothing trustworthy to compare the event channel
+            # against. Silently skipping would make an unmeasured
+            # separation check indistinguishable from a correctly
+            # separated one, which is exactly the failure mode this
+            # project exists to rule out. Surface it as an error instead;
+            # the events-side findings already proved still ride along.
+            missing = []
+            if not window_has_allow:
+                missing.append(f"an allowed request to {allowed}")
+            if not window_has_deny:
+                missing.append(f"a denied request to {blocked}")
+            return ProbeOutcome(
+                findings=findings,
+                errors=[ProbeError(
+                    self.probe_id, target.name, "channel_separation",
+                    "the channel separation check could not be evaluated: this "
+                    f"run's request-log window is missing {' and '.join(missing)}, "
+                    "so there is nothing to compare the event channel against",
+                )],
+                control_ok=False,
+            )
+
+        channel_carries_allowed = any(
+            event.get("host") == allowed for event in events_delta
+        )
+        if channel_carries_allowed:
+            findings.append(Finding(
+                probe_id=self.probe_id, subject=target.name,
+                rule_key="channel_not_separated", severity=Severity.MEDIUM,
+                title="The alert channel is not separated from the request log",
+                evidence=(
+                    f"this run's window shows an allowed request to {allowed} "
+                    f"and a denied request to {blocked} both went through, and "
+                    f"the event channel carries an entry for {allowed} too. "
+                    "Every request appears on the event channel, so violations "
+                    "are not distinguished from ordinary traffic. That is the "
+                    "same haystack under a different name."
+                ),
+            ))
 
         return ProbeOutcome(findings=findings, control_ok=True)
 

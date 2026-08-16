@@ -36,7 +36,9 @@ def _target(
         request_log_command=["true"] if request_configured else None,
         proxy=proxy,
     )
-    inner = {"attempted": ["allowed.invalid", "blocked.invalid"]}
+    # The real payload's result dict carries no fields; its marked line
+    # existing at all is what proves the crossing loop ran to completion.
+    inner = {}
 
     def run_inside(argv, timeout):
         if sent is not None:
@@ -124,14 +126,32 @@ def test_event_channel_with_only_the_denial_is_not_flagged():
     assert "channel_not_separated" not in _keys(outcome)
 
 
-def test_channel_not_separated_is_not_checked_without_an_allowed_entry_in_the_window():
+def test_incomplete_window_surfaces_as_an_error_not_a_silent_pass():
     """The request log did not show an allowed request went through in this
     window (only the denial), so there is nothing to compare the event
-    channel's extra entry against; the check must not fire off a partial
-    window."""
+    channel's extra entry against. The check must not fire, but it also
+    must not simply say nothing: an unmeasured separation check that reads
+    the same as a correctly separated one is the false-clean failure mode
+    this project exists to rule out, so it must surface as a ProbeError."""
     entries = [_ALERT, {"host": "allowed.invalid", "decision": "allow"}]
     outcome = DetectionProbe().run(_target(entries, request_delta=[_DENY_ENTRY]))
     assert "channel_not_separated" not in _keys(outcome)
+    assert outcome.errors
+    assert not outcome.control_ok
+    assert outcome.errors[0].operation == "channel_separation"
+    assert "allowed.invalid" in outcome.errors[0].detail
+
+
+def test_incomplete_window_still_carries_an_events_side_finding_already_proved():
+    """The request-log window is incomplete for channel_not_separated, but
+    the events delta already proved severity_understated independently.
+    That finding must ride along with the channel_separation error rather
+    than being discarded by it."""
+    entries = [dict(_ALERT, severity="LOW"), {"host": "allowed.invalid", "decision": "allow"}]
+    outcome = DetectionProbe().run(_target(entries, request_delta=[_DENY_ENTRY]))
+    assert "severity_understated" in _keys(outcome)
+    assert outcome.errors
+    assert outcome.errors[0].operation == "channel_separation"
 
 
 def test_channel_not_separated_is_not_checked_when_request_log_is_unconfigured():
@@ -142,6 +162,49 @@ def test_channel_not_separated_is_not_checked_when_request_log_is_unconfigured()
     outcome = DetectionProbe().run(_target(entries, request_configured=False))
     assert "channel_not_separated" not in _keys(outcome)
     assert outcome.errors == []
+
+
+# --- A request-log failure must not discard a finding the events delta
+# already proved. Findings are computed from the events delta before the
+# request log is read a second time, and a secondary, request-log-backed
+# check failing afterward must not throw away a HIGH finding to protect a
+# MEDIUM one.
+
+def test_request_log_failure_preserves_an_already_proved_violation_finding():
+    target = _target([])  # no alert for the violation: violation_unalerted
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(0, "", "")
+        return ExecResult(1, "", "no such container")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = DetectionProbe().run(target)
+    assert "violation_unalerted" in _keys(outcome)
+    assert outcome.errors
+    assert not outcome.control_ok
+    assert outcome.errors[0].operation == "read_request_log"
+    assert "no such container" in outcome.errors[0].detail
+
+
+def test_request_log_shrinking_preserves_an_already_proved_severity_finding():
+    target = _target([dict(_ALERT, severity="LOW")])
+    calls = {"n": 0}
+    long_body = "\n".join(json.dumps(e) for e in _BOTH_LOGGED * 3)
+    short_body = "\n".join(json.dumps(e) for e in _BOTH_LOGGED)
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        return ExecResult(0, long_body if calls["n"] == 1 else short_body, "")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = DetectionProbe().run(target)
+    assert "severity_understated" in _keys(outcome)
+    assert outcome.errors
+    assert not outcome.control_ok
+    assert outcome.errors[0].operation == "read_request_log"
 
 
 # --- The event channel is append-only; the comparison must not be.
