@@ -35,9 +35,13 @@ and a run that never reports clean for anything it did not measure.
 ## Run it in one command
 
 No cloud account and no credentials are required. Everything runs locally
-against containers, and every hostname the reference uses ends in `.invalid`,
-which RFC 2606 reserves so it can never resolve for anyone. You need Python
-3.11 or newer and Docker with Compose v2.
+against containers. The named hosts the reference target uses end in
+`.invalid`, which RFC 2606 reserves so they can never resolve for anyone, and
+the two things it points at the outside world are chosen to be inert: a TCP
+connection attempt to `1.1.1.1:443`, and a DNS lookup of `example.com`. Both
+are checks that fire only on a sandbox that should not have reached them.
+Neither is required for the suite to pass. You need Python 3.11 or newer and
+Docker with Compose v2.
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
@@ -148,8 +152,16 @@ HIGH    filesystem  runtime_socket
         /var/run/docker.sock exists. Access to the runtime socket is equivalent to control of the host.
 
 HIGH    network  blocked_egress
+        The sandbox has a route to the public internet
+        opened a TCP connection to 1.1.1.1:443, an address literal that needs no name resolution. Ambient egress, whatever the allowlist says.
+
+HIGH    network  blocked_egress
         The sandbox reached a host that is not on the allowlist
         opened a TCP connection to unauthorized:80
+
+HIGH    network  dns_canary
+        The sandbox resolved a public name
+        resolved example.com. Name resolution is an exfiltration channel that an HTTP allowlist does not cover.
 
 MEDIUM  bounds  memory_uncapped
         No memory limit is configured
@@ -161,6 +173,13 @@ MEDIUM  bounds  wallclock_uncapped
 $ echo $?
 2
 ```
+
+Two of those lines depend on the machine you run this on having internet
+access: the route to `1.1.1.1:443` and the resolution of `example.com`. On a
+machine with no internet they are absent, and the third network line, the one
+that reaches a container inside the fixture, is still there. That asymmetry is
+deliberate. A check that needs the outside world can add a finding but must
+never be what a clean result rests on.
 
 The exit code is worth dwelling on, because it is not 3. This target has no
 broker, so it has no request log, no event channel, and no reset path, which
@@ -188,8 +207,10 @@ These tables are the full reference of all 23 rule keys, not a list of what
 the demo above exercises. The leaky fixture trips nine of them end to end, and
 they are exactly the nine in its output: `blocked_egress`, `env_secret`,
 `outside_workspace`, `runtime_socket`, `no_request_log`, `no_event_channel`,
-`no_reset_configured`, `memory_uncapped`, `wallclock_uncapped`. The other
-fourteen (`dns_canary`, `c2_channel`, `credential_file`, `imds_reachable`,
+`no_reset_configured`, `memory_uncapped`, `wallclock_uncapped`. A tenth,
+`dns_canary`, trips as well when the machine running the fixture has internet
+access, and the end-to-end suite does not assert it for exactly that reason.
+The other fourteen (`c2_channel`, `credential_file`, `imds_reachable`,
 `imds_hop_limit`, `proc_environ`, `workspace_missing`, `pids_uncapped`,
 `persists_across_runs`, `crossing_unlogged`, `decision_missing`,
 `violation_unalerted`, `severity_understated`, `channel_not_separated`) are
@@ -201,13 +222,33 @@ to read.
 ### 1. No ambient network, and the broker is not a trusted zone
 
 Probe id `network`. The sandbox has no route to anything by default, and all
-egress passes a broker applying an allowlist. Three questions, not one: can
-the sandbox reach a host it should not, can it resolve names (the exfiltration
-path an HTTP allowlist never sees), and can it reach the classes of host that
-serve as staging and command-and-control. An allowlisted destination is not a
-trusted destination: package registries, pastebins, request-capture services,
-and file-drop hosts are exfiltration channels whether or not the hostname is on
-the list.
+egress passes a broker applying an allowlist. Four questions, not one. Can the
+sandbox open a TCP connection to `blocked_endpoint`, a bare `IP:port` literal.
+Can it reach a host it should not by name. Can it resolve `dns_canary_host`,
+name resolution being the exfiltration path an HTTP allowlist never sees. And
+can it reach the classes of host that serve as staging and command-and-control.
+An allowlisted destination is not a trusted destination: package registries,
+pastebins, request-capture services, and file-drop hosts are exfiltration
+channels whether or not the hostname is on the list.
+
+The first question is the one that carries the invariant, and it is the only
+one with no name in it. Every name-based check has a failure mode that looks
+exactly like containment: a name that does not resolve is unreachable from a
+locked-down sandbox and from a wide open one alike, so a config full of
+unresolvable names produces a clean network result on a sandbox with a default
+route to the internet. That is not hypothetical. It is what this harness did
+until the address-literal check was added, and the fix is the reason each
+check now reports *why* it did not fire:
+
+| Inner status | What it means | How the probe reads it |
+| --- | --- | --- |
+| `connected` / `resolved` | The sandbox reached it. | Finding. |
+| `denied` | The attempt was made and refused. | A measurement. Clean. |
+| `unresolved` | The name did not resolve, so nothing was attempted. | Not a finding and not a pass. Nothing was measured. |
+| `unattempted` | The literal could not be used at all. | `ProbeError`. The run is incomplete and cannot print `CONTAINED`. |
+
+So a clean `network` result rests on `blocked_endpoint` having been attempted
+and denied. An `unresolved` name never contributes to it.
 
 | Rule key | Severity |
 | --- | --- |
@@ -220,6 +261,16 @@ something other than a denial. In a correctly contained sandbox nothing is
 directly reachable, so the control cannot be direct reachability of the
 allowed host. A target with no `proxy` configured falls back to direct
 reachability of `allowed_host`.
+
+**Without internet access**, `blocked_endpoint` still measures: no route is no
+route, whether the address is unroutable from this sandbox or from this whole
+machine. The DNS canary and the name-based reach checks are the ones that lose
+their teeth offline, and they lose them in the safe direction. They can only
+add findings, never subtract them, so an offline run detects less and claims
+no more. The suite is built to that rule: every case that asserts a network
+leak asserts it from something reachable inside the fixtures, and the one that
+proves a route out of the reference sandbox is a finding points at a
+neighbouring container rather than at a public address.
 
 ### 2. No ambient credentials
 
@@ -409,12 +460,14 @@ from stdin, such as `python3 -`.
 | `name` | string | The target's name. It appears as the `subject` on every finding. |
 | `exec_command` | list of strings | Runs a command inside the sandbox, reading the payload from stdin. |
 | `allowed_host` | string | A host the sandbox is legitimately permitted to reach. Used as the network probe's positive control. |
-| `blocked_host` | string | A host the sandbox must not reach. It has to genuinely resolve and answer, or the check cannot tell a contained sandbox from an unreachable name. |
+| `blocked_host` | string | A host the sandbox must not reach, by name. When it resolves and answers, reaching it is a finding; when it does not resolve, the check reports `unresolved` and measures nothing, which is why it is not the check this invariant rests on. |
 
 ### Optional keys
 
 | Key | Type | What it is, and what its absence means |
 | --- | --- | --- |
+| `blocked_endpoint` | string, `IP:port` | The address literal the sandbox must not reach. Defaults to `1.1.1.1:443`. Needs no DNS, so it measures raw routability in every environment, and it is what a clean `network` result rests on. A hostname here is rejected, because a hostname would put name resolution back in front of the one check that survives without it. |
+| `dns_canary_host` | string | A name that genuinely resolves wherever DNS egress exists. Defaults to `example.com`. Resolving it is a `dns_canary` finding. Failing to resolve it is not a pass, because an environment with no DNS at all fails the same way. |
 | `c2_hosts` | list of strings | Staging and command-and-control class hosts (pastebins, request-capture services, file drops). Absent means `c2_channel` is not exercised. |
 | `proxy` | string, `host:port` | The egress broker. When set, the network positive control and the attribution and detection crossings go through it in absolute-URI form. When absent, those probes fall back to direct reachability, which is honest about proving less. |
 | `request_log_command` | list of strings | Run outside the sandbox; prints the broker's request log on stdout. Absent produces `no_request_log`. |
@@ -424,8 +477,9 @@ from stdin, such as `python3 -`.
 
 Malformed configs are rejected with one line a reader can act on rather than a
 traceback: the four required keys must be present, `name`, `allowed_host`,
-`blocked_host` and `proxy` must be strings, the four command keys and
-`c2_hosts` must be lists of strings, and `wallclock_limit_seconds` must be an
+`blocked_host`, `dns_canary_host` and `proxy` must be strings, the four command
+keys and `c2_hosts` must be lists of strings, `blocked_endpoint` must be an
+address literal and a port in range, and `wallclock_limit_seconds` must be an
 integer (`true` is not an integer here, even though Python's `bool` is a
 subclass of `int`).
 
