@@ -31,16 +31,15 @@ some real deployment ships by default anyway.
   its full default capability set on a writable filesystem. Invariants 2
   and 3 fail together: an escape from this container is an escape as root.
 
-## The `authorized` and `unauthorized` services (amendments to the brief)
+## The `authorized` and `unauthorized` services
 
-The brief that shaped this fixture set `blocked_host` to a `.invalid` name,
-matching the reference target. That cannot demonstrate a leak: RFC 2606
-reserves `.invalid` so it never resolves, for anyone, including a sandbox
-with completely open networking. A network probe that tries to connect to
-a `.invalid` host fails the same way whether the sandbox is contained or
-wide open, which means the leaky fixture would report no network finding
-and the suite's own assertion that this fixture trips `blocked_egress`
-would be false.
+The obvious choice for `blocked_host` is a `.invalid` name, matching the
+reference target. That cannot demonstrate a leak: RFC 2606 reserves
+`.invalid` so it never resolves, for anyone, including a sandbox with
+completely open networking. A network probe that tries to connect to a
+`.invalid` host fails the same way whether the sandbox is contained or wide
+open, which means this fixture would report no network finding and the
+suite's own assertion that it trips `blocked_egress` would be false.
 
 `unauthorized` is the fix: a second service on the same default network as
 `sandbox`, running a stdlib `python3 -m http.server` on port 80. It stands
@@ -50,17 +49,16 @@ public hostname, it is exempt from the `.invalid` convention that applies
 everywhere else in this repository; `target.json` points `blocked_host` at
 `unauthorized` for exactly this reason.
 
-`authorized` is the same fix applied to the other side of the test, and it
-corrects an error in the first version of this fixture. That version left
-`allowed_host` as a `.invalid` name on the reasoning that everything except
-`blocked_host` should stay unreachable. That reasoning does not hold for
-`allowed_host`, because `allowed_host` is not another thing the sandbox
-should fail to reach: it is the network probe's **positive control**, the
-host the probe reaches in order to prove it can observe reachability at
-all. The reference sandbox proves that control through its broker. This
-stack has no broker, so the probe falls back to reaching `allowed_host`
-directly, and a `.invalid` name fails that fallback for everyone,
-contained or not. The result was a wide-open fixture reporting that the
+`authorized` is the same fix applied to the other side of the test. The
+tempting reasoning is that everything except `blocked_host` should stay
+unreachable, so `allowed_host` should be a `.invalid` name too. That
+reasoning does not hold, because `allowed_host` is not another thing the
+sandbox should fail to reach: it is the network probe's **positive
+control**, the host the probe reaches in order to prove it can observe
+reachability at all. The reference sandbox proves that control through its
+broker. This stack has no broker, so the probe falls back to reaching
+`allowed_host` directly, and a `.invalid` name fails that fallback for
+everyone, contained or not. A wide-open fixture would then report that the
 network probe "could not confirm it was testing a reachable target" in the
 same run where it reported a live TCP connection to `unauthorized`, which
 is both false and the wrong lesson. `c2_hosts` do stay `.invalid`: those

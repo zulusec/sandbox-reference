@@ -67,9 +67,17 @@ instead.
 
 ## Hostnames
 
-Every hostname used here, in the allowlist, the target config, and any
-fixture, ends in `.invalid`. RFC 2606 reserves that suffix so it cannot
-resolve for anyone running this. No real vendor or service is named.
+Every hostname this reference sandbox uses, in `allowlist.json` and in
+`reference/target.json`, ends in `.invalid`. RFC 2606 reserves that suffix
+so it cannot resolve for anyone running this. No real vendor or service is
+named.
+
+The leaky fixture under `fixtures/leaky/` is the deliberate exception. It
+has to demonstrate a leak, which needs a host that genuinely answers, so
+its `allowed_host` and `blocked_host` are the Compose service names
+`authorized` and `unauthorized` on a private network. Its own README
+explains why. Its `c2_hosts` stay `.invalid`, because those are supposed to
+stay unreachable.
 
 ## Running it
 

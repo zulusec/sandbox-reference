@@ -334,7 +334,7 @@ and does not pretend to.
 
 ## Limitations
 
-Four of them, stated here rather than buried, because a harness implying
+Five of them, stated here rather than buried, because a harness implying
 coverage it does not have would be worse than no harness.
 
 **1. Confused-deputy attacks are out of reach.** The harness tests what the
@@ -374,6 +374,22 @@ of them measure. It is listed under
 [What it is not](#what-it-is-not) as well, because it is the same discipline
 seen from the other side.
 
+**5. Four of the six probes take the sandbox at its word.** `network`,
+`credentials`, `filesystem` and `bounds` measure by running a payload inside
+the sandbox and reading the line it prints back. A sandbox already under an
+adversary's control can print whatever it likes, so a clean result from those
+four means the sandbox said it was clean. `attribution` and `detection` are
+the exceptions: they generate boundary crossings from inside, but their
+evidence is the broker's request log and event channel, read from outside on a
+host the sandbox has no route to, and a sandbox that skips the crossings makes
+those probes report a finding rather than a pass. Where the harness supplied a
+value it compares against its own copy rather than the sandbox's echo of it,
+and everything that does come back is stripped of control characters and
+bounded in length and count before it reaches the report, so a hostile target
+cannot forge the report itself. It can still forge the measurement in those
+four probes. This harness answers whether a sandbox is configured to contain,
+not whether an already-compromised one is telling the truth.
+
 ## Probing your own sandbox
 
 A target is any sandbox the harness can run a command inside. Everything
@@ -407,10 +423,17 @@ from stdin, such as `python3 -`.
 | `wallclock_limit_seconds` | integer | Declares that something outside the sandbox bounds task duration. Absent produces `wallclock_uncapped`. Read limitation 2 before relying on this key. |
 
 Malformed configs are rejected with one line a reader can act on rather than a
-traceback: the four required keys must be present, the four command keys must
-be lists of strings, `proxy` must be a string, and `wallclock_limit_seconds`
-must be an integer (`true` is not an integer here, even though Python's `bool`
-is a subclass of `int`).
+traceback: the four required keys must be present, `name`, `allowed_host`,
+`blocked_host` and `proxy` must be strings, the four command keys and
+`c2_hosts` must be lists of strings, and `wallclock_limit_seconds` must be an
+integer (`true` is not an integer here, even though Python's `bool` is a
+subclass of `int`).
+
+A bare string where a list belongs is the case worth naming, because accepting
+it would measure nothing and say nothing. `"c2_hosts": "paste.example"` reads
+as thirteen single-character hostnames, none of which exists, so `c2_channel`
+would report clean having never probed the host the operator meant. It is
+rejected instead.
 
 ### A worked example that is not Compose
 

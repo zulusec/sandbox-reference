@@ -6,7 +6,17 @@ services:
     command: ["sleep", "infinity"]
     working_dir: /workspace
     volumes:
-      - ./workspace:/workspace:rw
+      # A tmpfs, not a bind mount from this checkout. The probes need a
+      # writable workspace and nothing more, so this is fixture plumbing
+      # rather than one of the wrong answers under test. A bind mount here
+      # would have Docker create ./workspace owned by root, and `down -v`
+      # does not remove it, so a reader who follows the instructions below
+      # would be left with a directory in their checkout they cannot delete
+      # without sudo.
+      - type: tmpfs
+        target: /workspace
+        tmpfs:
+          mode: 01777
       - /:/host:ro                              # invariant 3: host filesystem
       - /var/run/docker.sock:/var/run/docker.sock  # invariant 3: runtime socket
     environment:
