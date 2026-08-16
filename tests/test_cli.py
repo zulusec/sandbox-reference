@@ -79,8 +79,12 @@ def test_probe_selection_runs_only_the_named_probe(tmp_path, capsys):
     }), encoding="utf-8")
     cli.main(["--target", str(path), "--probe", "filesystem", "--json"])
     payload = json.loads(capsys.readouterr().out)
+    # Equality, not a subset. A subset assertion against a set that may be
+    # empty is satisfied by a run where no probe ran at all, which is the
+    # opposite of what this test is named for.
+    assert payload["metadata"]["probes_ran"] == ["filesystem"]
     reported = {error["probe_id"] for error in payload["metadata"]["errors"]}
-    assert reported <= {"filesystem"}
+    assert reported == {"filesystem"}
 
 
 def test_unknown_probe_name_exits_cannot_start(tmp_path, capsys):

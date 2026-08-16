@@ -257,3 +257,36 @@ def test_a_wrong_typed_cap_is_an_error_not_an_uncapped_sandbox():
     assert outcome.errors
     assert outcome.control_ok is False
     assert "memory_uncapped" not in _keys(outcome)
+
+
+# --- The marker this probe writes is always removed before it finishes, on
+# every path. A removal that failed must be reported: a stray file left in a
+# target's workspace by a posture tool is the tool's own mess, and one that
+# nobody is told about is worse than one that is.
+
+def test_a_marker_that_survived_removal_is_reported_as_an_error():
+    outcome = BoundsProbe().run(_target([_BOUNDED, dict(_BOUNDED, marker_removed=False)]))
+    assert any(error.operation == "cleanup" for error in outcome.errors)
+    detail = next(e.detail for e in outcome.errors if e.operation == "cleanup")
+    assert "could not remove it" in detail
+
+
+def test_a_failed_cleanup_on_the_no_reset_path_is_reported():
+    """No reset command means nothing else will ever clean this marker up,
+    so a failed removal there is the one that matters most."""
+    outcome = BoundsProbe().run(_target(
+        [_BOUNDED, dict(_BOUNDED, marker_removed=False)], reset_configured=False))
+    assert "no_reset_configured" in _keys(outcome)
+    assert any(error.operation == "cleanup" for error in outcome.errors)
+
+
+def test_a_failed_cleanup_on_the_failed_reset_path_is_reported():
+    outcome = BoundsProbe().run(_target(
+        [_BOUNDED, dict(_BOUNDED, marker_removed=False)], reset_ok=False))
+    assert any(error.operation == "cleanup" for error in outcome.errors)
+    assert any(error.operation == "reset" for error in outcome.errors)
+
+
+def test_a_successful_cleanup_reports_nothing():
+    outcome = BoundsProbe().run(_target([_BOUNDED, _BOUNDED]))
+    assert [e for e in outcome.errors if e.operation == "cleanup"] == []
