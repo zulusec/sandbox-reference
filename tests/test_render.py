@@ -83,3 +83,42 @@ def test_table_names_partial_selection_and_never_says_contained():
 def test_table_says_contained_when_selection_matches_registry():
     metadata = {"probes_selected": ["network"], "probes_registered": ["network"]}
     assert "CONTAINED" in render.to_table(_report(), metadata)
+
+
+# --- The two renderers describe one run, so they have to describe it the
+# same way. Automation reads the JSON and never sees the table, which makes
+# the JSON the more dangerous of the two to let drift.
+
+def _partial_metadata():
+    return {"probes_selected": ["network"],
+            "probes_registered": ["filesystem", "network"]}
+
+
+def test_json_partial_run_is_not_complete():
+    """One probe of two ran clean. The table refuses CONTAINED for it, so a
+    field named complete must not say true beside an empty findings list."""
+    payload = json.loads(render.to_json(_report(), _partial_metadata()))
+    assert payload["metadata"]["complete"] is False
+    assert payload["metadata"]["coverage_complete"] is False
+
+
+def test_json_and_table_agree_about_a_partial_run():
+    report = _report()
+    metadata = _partial_metadata()
+    payload = json.loads(render.to_json(report, metadata))
+    table = render.to_table(report, metadata)
+    assert ("CONTAINED" in table) is (
+        payload["metadata"]["complete"] and not payload["findings"]
+    )
+
+
+def test_json_names_the_probes_that_produced_a_result():
+    payload = json.loads(render.to_json(_report(), _partial_metadata()))
+    assert payload["metadata"]["probes_ran"] == ["network"]
+
+
+def test_json_full_coverage_stays_complete():
+    metadata = {"probes_selected": ["network"], "probes_registered": ["network"]}
+    payload = json.loads(render.to_json(_report(), metadata))
+    assert payload["metadata"]["complete"] is True
+    assert payload["metadata"]["coverage_complete"] is True
