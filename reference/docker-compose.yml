@@ -1,7 +1,21 @@
 services:
+  # Invariant 1 says the broker is itself contained, because a broker with
+  # unrestricted internet access is a pivot with a hostname rather than a
+  # control. This one is held to that: it sits only on the internal network,
+  # because it forwards nothing and so needs no route out. A broker that did
+  # forward would need one, and would then need its own egress policy, its
+  # own logging, and everything else this file gives the sandbox. That is the
+  # cost of putting a component in the trust path, and it is the reason the
+  # broker is the most security-sensitive part of this stack.
+  #
+  # The caps are here for the same reason. Without them the broker is an
+  # uncapped process reachable from the sandbox, so a sandbox held to 256 MB
+  # could drive memory on the other side of the boundary and route around its
+  # own limit. A bound that the next process over can spend on your behalf is
+  # not a bound.
   broker:
     build: ./broker
-    networks: [contained, egress]
+    networks: [contained]
     volumes:
       - ./allowlist.json:/etc/broker/allowlist.json:ro
       - broker-logs:/var/log/broker
@@ -10,7 +24,28 @@ services:
     user: "10001:10001"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: 0.5
+    # The broker is the sandbox's only route anywhere, so "started" is not
+    # the same as "ready": a probe that runs in the gap between the two sees
+    # a refused connection and reports a control failure that is really a
+    # startup race. Declaring readiness lets `up --wait` mean what it says.
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import socket; socket.create_connection(('127.0.0.1', 3128), timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
 
+  # init gives the container a real PID 1 that forwards signals and reaps
+  # children. Without it the command itself is PID 1, and the kernel ignores
+  # any signal PID 1 has not explicitly handled, so a reset sends SIGTERM,
+  # waits out the full stop timeout, and only succeeds because Docker
+  # eventually sends SIGKILL. Invariant 4 asks for a reset between tasks, and
+  # a reset that is really a ten second hang followed by a kill is not one.
+  # It also means a process inside cannot be asked to stop, only killed.
   sandbox:
     image: python:3.12-alpine
     command: ["sleep", "infinity"]
@@ -28,6 +63,16 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     pids_limit: 128
+    # A sandbox that is "started" is not yet a sandbox that can take work,
+    # and `up --wait` needs something definite to wait on for every service
+    # rather than only for the broker. Readiness here is simply that the
+    # interpreter the probes exec is present and runs.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "print(1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 1s
     environment:
       HTTP_PROXY: "http://broker:3128"
       HTTPS_PROXY: "http://broker:3128"
@@ -35,7 +80,6 @@ services:
 networks:
   contained:
     internal: true
-  egress: {}
 
 volumes:
   broker-logs: {}

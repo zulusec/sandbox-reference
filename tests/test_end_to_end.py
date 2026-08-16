@@ -96,9 +96,15 @@ def _pairs(payload: dict) -> set:
 
 @pytest.fixture(scope="module", autouse=True)
 def _stacks():
-    reference_up = _compose(_REFERENCE, "up", "-d", "--build")
+    # --wait, not bare -d. The broker declares a healthcheck, and without
+    # waiting on it the first probe can run in the window between the
+    # container starting and the socket binding. That surfaces as a control
+    # failure on a sandbox that is actually fine, which is the most
+    # expensive kind of flake: it looks exactly like the defect this suite
+    # exists to catch.
+    reference_up = _compose(_REFERENCE, "up", "-d", "--build", "--wait")
     assert reference_up.returncode == 0, reference_up.stderr
-    leaky_up = _compose(_LEAKY, "up", "-d")
+    leaky_up = _compose(_LEAKY, "up", "-d", "--wait")
     assert leaky_up.returncode == 0, leaky_up.stderr
     yield
     _compose(_REFERENCE, "down", "-v")
@@ -265,10 +271,47 @@ def _network_statuses(target_path: str) -> dict:
 
     The probe's own output says which checks fired. These say which checks
     ran, which is the distinction this repository exists to keep.
+
+    The returncode is checked before the output is parsed, for the same
+    reason the probe folds it into its own error detail: a container that
+    was killed mid-exec produces no marked line, and parsing first reports
+    that as a payload that misbehaved. The truth is a target-side failure,
+    and a test that cannot tell those apart wastes the time of whoever
+    reads it. A SIGKILL here (137) means something outside this run
+    restarted or removed the container.
     """
     target = load_target(REPO_ROOT / target_path)
     executed = target.run_inside([build_payload(target)], timeout=90)
+    assert executed.returncode == 0, (
+        f"exec into {target_path} failed with exit {executed.returncode}: "
+        f"stderr {executed.stderr.strip()!r}, stdout {executed.stdout.strip()!r}"
+    )
     return parse_inner(executed.stdout)
+
+
+def test_the_reference_reset_leaves_the_sandbox_usable_before_it_returns(_stacks):
+    """A reset that returns before the sandbox is back breaks every probe
+    that runs after it.
+
+    `docker compose restart` returns in tens of milliseconds on this Compose
+    version and leaves the service down, so the next probe execs into a
+    container that is stopping and gets SIGKILLed partway through. That
+    surfaces as exit 137, an empty result, and a failed positive control:
+    the harness reports that it could not measure, which is honest but is
+    caused entirely by the reset command. Whatever reset_command is, it has
+    to be synchronous.
+    """
+    target = load_target(REPO_ROOT / _REFERENCE_TARGET)
+    reset = target.reset()
+    assert reset.returncode == 0, reset.stderr
+    executed = target.run_inside(
+        ["import time\nfor _ in range(8): time.sleep(1)\nprint('alive')"], timeout=60,
+    )
+    assert executed.returncode == 0, (
+        f"exec straight after reset failed with exit {executed.returncode}: "
+        f"stderr {executed.stderr.strip()!r}"
+    )
+    assert "alive" in executed.stdout
 
 
 def test_the_reference_network_result_rests_on_a_check_that_ran(_stacks):

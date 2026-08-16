@@ -14,6 +14,7 @@ tell you while it matters.
 
 from __future__ import annotations
 
+import datetime
 import http.server
 import json
 import os
@@ -31,9 +32,22 @@ _LOCK = threading.Lock()
 
 
 def host_of(authority: str) -> str:
-    """Strip any port and lowercase. Accepts 'host', 'host:port', or a URL."""
+    """Strip any userinfo and port, and lowercase.
+
+    Accepts 'host', 'host:port', or a URL.
+
+    The userinfo strip is the load-bearing line. RFC 3986 authority is
+    [userinfo '@'] host [':' port], so in
+    'http://allowed.example:80@evil.example/' the real host is evil.example
+    and everything before the last '@' is decoration the client chose. A
+    parser that splits on ':' first reads 'allowed.example' instead, and
+    then one request defeats the allowlist, records the wrong host in
+    requests.log, and raises no event, all three at once. Partition from the
+    right, because userinfo may itself contain '@'.
+    """
     if "://" in authority:
         authority = urllib.parse.urlsplit(authority).netloc
+    authority = authority.rpartition("@")[2]
     if authority.startswith("["):  # IPv6 literal
         return authority.split("]")[0].lstrip("[").lower()
     return authority.split(":")[0].strip().lower()
@@ -70,12 +84,31 @@ def _write(path: str, record: dict) -> None:
         handle.flush()
 
 
-def log_decision(host: str, method: str, allowed: bool) -> None:
-    _write(REQUEST_LOG, {"host": host, "method": method,
-                         "decision": "allow" if allowed else "deny"})
+def _now() -> str:
+    """UTC, RFC 3339, second resolution.
+
+    A log line with no time answers what was reached but not when, and
+    invariant 5 asks for both. Findings stay free of wall-clock values so
+    the harness output remains byte-identical between runs; this is the
+    broker's own log, which is evidence rather than output, and evidence
+    without a time is most of the way to useless.
+    """
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_decision(host: str, method: str, allowed: bool, client: str) -> None:
+    """Record one crossing on both channels.
+
+    'client' is this reference's stand-in for a principal. A peer address is
+    a weak identity and naming it as the principal would overstate what this
+    broker knows, so the field is called what it is. Invariant 5 asks on
+    whose authority a crossing happened, and in a real deployment this is
+    where a workload identity belongs.
+    """
+    record = {"time": _now(), "client": client, "host": host, "method": method}
+    _write(REQUEST_LOG, {**record, "decision": "allow" if allowed else "deny"})
     if not allowed:
-        _write(EVENT_LOG, {"severity": "HIGH", "event": "egress_denied",
-                           "host": host, "method": method})
+        _write(EVENT_LOG, {**record, "severity": "HIGH", "event": "egress_denied"})
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -99,16 +132,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def _drain_body(self) -> None:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if length:
-            self.rfile.read(length)
+    def _drain_body(self) -> bool:
+        """Consume the request body. False when the stream can no longer be trusted.
+
+        Content-Length is attacker-chosen text, and a chunked body carries no
+        length at all. Either can leave bytes unread, and unread bytes on a
+        persistent connection are read as the next request line, which drops
+        that next request from both logs. When the body cannot be drained
+        exactly, the honest move is to stop reusing the connection rather
+        than to guess.
+        """
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return False
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            return False
+        if length < 0:
+            return False
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                return False
+            remaining -= len(chunk)
+        return True
 
     def _handle(self, method: str) -> None:
-        self._drain_body()
+        # Log before draining, never after. Draining parses attacker-supplied
+        # framing headers, and any failure there used to raise past this
+        # point and take the whole crossing with it: no request log line, no
+        # event, no alert, for a request the broker had already received.
+        # The decision is knowable from the request line alone, so record it
+        # first and let the framing be the thing that fails.
         host = host_of(self.path)
         allowed = decide(host, _load_allowlist())
-        log_decision(host, method, allowed)
+        log_decision(host, method, allowed, self.client_address[0])
+        if not self._drain_body():
+            self.close_connection = True
         self.send_response(403 if not allowed else 502)
         self.send_header("Content-Length", "0")
         self.end_headers()

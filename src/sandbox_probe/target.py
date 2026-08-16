@@ -15,6 +15,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,7 +71,53 @@ class Target:
         return self._read(self.events_command, timeout)
 
     def reset(self, timeout: int = 60) -> ExecResult:
-        return self._read(self.reset_command, timeout)
+        """Reset the sandbox, then wait until it can actually take work.
+
+        A reset command that has returned is not the same as a sandbox that
+        is ready, and the gap between the two is silent. Container runtimes
+        report a restart as complete once the new process has been started,
+        which can be well before an exec into it will succeed. Whatever
+        probe runs next then gets an exec failure and reports a positive
+        control that did not hold, on a sandbox that is fine. That reads
+        exactly like the defect this tool exists to find, which makes it
+        the most expensive possible way to be wrong.
+
+        So readiness is established rather than assumed. If it never
+        arrives, that is returned as a failure of the reset itself, which
+        is the honest place to put it.
+        """
+        outcome = self._read(self.reset_command, timeout)
+        if outcome.returncode != 0:
+            return outcome
+        return self._await_ready(outcome)
+
+    # The readiness payload asks the sandbox to still be there in a moment,
+    # rather than merely to answer. `docker compose restart` returns before
+    # the container has stopped, so an exec issued the instant it returns is
+    # answered by the container that is about to be killed: readiness looks
+    # established, the next probe starts a payload that takes half a minute,
+    # and the stop lands in the middle of it. What comes back is exit 137,
+    # an empty result and a failed positive control, on a sandbox that is
+    # fine. An exec that survives an interval cannot be answered by a
+    # container that is on its way down.
+    _READY_PAYLOAD = "import time\ntime.sleep(2)\n"
+
+    def _await_ready(self, outcome: ExecResult, attempts: int = 30) -> ExecResult:
+        for remaining in range(attempts - 1, -1, -1):
+            if _run(self.exec_command, stdin=self._READY_PAYLOAD, timeout=15).returncode == 0:
+                return outcome
+            if remaining:
+                time.sleep(0.5)
+        return ExecResult(
+            returncode=126,
+            stdout="",
+            stderr=(
+                "the reset command succeeded but the sandbox did not accept an "
+                f"exec within {attempts // 2} seconds, so it was never confirmed "
+                "ready and anything measured after this point would be measuring "
+                "a sandbox in an unknown state"
+            ),
+        )
 
     @staticmethod
     def _read(command: list[str] | None, timeout: int) -> ExecResult:

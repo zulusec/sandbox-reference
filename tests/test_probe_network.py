@@ -483,10 +483,31 @@ def test_a_forged_c2_host_never_reaches_the_terminal():
     assert outcome.findings == []
 
 
-def test_a_non_mapping_c2_result_is_not_walked_character_by_character():
-    """A string here would otherwise produce one finding per character."""
-    outcome = NetworkProbe().run(_target(_inner(c2="paste.invalid")))
-    assert outcome.findings == []
+def test_a_non_mapping_c2_result_is_an_error_not_a_clean_verdict():
+    """A string here would otherwise produce one finding per character, and
+    discarding it silently is worse than that.
+
+    c2_channel is the only check that catches a host an allowlist permits
+    because it looks like developer infrastructure, so a sandbox can be
+    denied every raw route (blocked_endpoint 'denied', honestly) and still
+    be reaching a paste host through the path it is allowed. Dropping a
+    malformed c2 result on the floor does not lose a finding in that case,
+    it manufactures the clean verdict.
+    """
+    for wrong in ("paste.invalid", ["paste.invalid"], None, 1):
+        outcome = NetworkProbe().run(_target(_inner(c2=wrong)))
+        assert outcome.findings == []
+        assert outcome.errors, f"c2={wrong!r} was discarded silently"
+        assert "c2 is" in outcome.errors[0].detail or "c2 is missing" in outcome.errors[0].detail
+        assert not outcome.control_ok
+
+
+def test_a_missing_c2_result_is_an_error_too():
+    inner = _inner()
+    del inner["c2"]
+    outcome = NetworkProbe().run(_target(inner))
+    assert outcome.errors
+    assert "c2 is missing" in outcome.errors[0].detail
 
 
 def test_c2_findings_follow_the_configs_order_not_the_targets():

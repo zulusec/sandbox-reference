@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from sandbox_probe.evidence import (
     BOOL,
+    MAPPING,
     TEXT,
     bounded,
     overflow_finding,
@@ -61,14 +62,19 @@ _MEASURED = ("connected", "denied")
 # exactly what a check reporting no egress produces. Declaring the shape is
 # what keeps a missing answer an error rather than a clean line.
 #
-# c2 is not here because it is a mapping and the declared shapes do not
-# cover one. Its own guard is _as_mapping, and a c2 result of the wrong
-# shape can only lose findings, never manufacture the clean verdict, which
-# blocked_endpoint alone carries.
+# c2 is declared like the rest. It is tempting to argue that a malformed c2
+# result can only lose a finding, because blocked_endpoint carries the clean
+# verdict. That is wrong, and the counter-example is the case this check
+# exists for: an egress policy that denies raw routes and permits the hosts
+# that look like developer infrastructure. There blocked_endpoint is
+# honestly 'denied', every other check is honestly negative, and c2 is the
+# only signal there is. Reading it with a falsy default would turn a
+# malformed answer into exit 0.
 _RESULT_SHAPE = {
     "blocked_endpoint": TEXT,
     "blocked_host": TEXT,
     "dns_canary": TEXT,
+    "c2": MAPPING,
     "control_reachable": BOOL,
 }
 
@@ -179,13 +185,6 @@ result['control_reachable'] = (
     )
 )
 """
-
-
-def _as_mapping(value) -> dict:
-    """A mapping, or an empty one. The payload's contract is an object
-    keyed by hostname, and a string arriving here must never be walked
-    character by character."""
-    return value if isinstance(value, dict) else {}
 
 
 def _exec_failure_detail(base: str, executed: ExecResult) -> str:
@@ -330,7 +329,10 @@ class NetworkProbe:
         # test write text of its choosing into this report. Reading the
         # statuses in the config's order also fixes the order, which the
         # target would otherwise pick.
-        reported = _as_mapping(inner.get("c2"))
+        # A dict by the time it gets here: the declared shape above is what
+        # guarantees it, rather than a local default that would swallow the
+        # wrong shape.
+        reported = inner["c2"]
         confirmed, dropped = bounded([
             host for host in target.c2_hosts if reported.get(host) == "connected"
         ])

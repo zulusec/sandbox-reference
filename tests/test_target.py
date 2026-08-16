@@ -63,6 +63,97 @@ def test_run_inside_reports_timeout_as_a_nonzero_result(tmp_path):
     assert "timed out" in result.stderr
 
 
+# --- A reset that returns before the sandbox is usable is not a reset.
+#
+# `docker compose restart` returns in tens of milliseconds on Compose v5 and
+# leaves the service still stopping, so the next probe execs into a container
+# that is about to be killed and gets SIGKILLed partway through its payload.
+# Observed live against the reference stack: two runs in three lost the
+# network probe that way, reporting exit 137, an empty result and a failed
+# positive control. The harness was honest about not having measured, and
+# the reason it had not measured was its own reset.
+
+def _counting_target(tmp_path, failures: int):
+    """A target whose exec fails `failures` times before it succeeds, the
+    way a container that is still restarting does."""
+    counter = tmp_path / "attempts"
+    counter.write_text("", encoding="utf-8")
+    script = tmp_path / "flaky-exec.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        f'printf x >> "{counter}"\n'
+        f'attempts=$(wc -c < "{counter}")\n'
+        f"if [ \"$attempts\" -le {failures} ]; then\n"
+        '  echo "service \\"sandbox\\" is not running" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        "echo ready\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return load_target(_write(tmp_path, dict(
+        _MINIMAL, exec_command=[str(script)], reset_command=["true"],
+    ))), counter
+
+
+def test_reset_waits_until_the_sandbox_can_run_a_command_again(tmp_path):
+    target, counter = _counting_target(tmp_path, failures=3)
+    result = target.reset(timeout=30)
+    assert result.returncode == 0
+    # The reset command itself succeeded immediately; what took the time was
+    # waiting for the sandbox to answer. Four attempts: three refusals and
+    # the one that worked.
+    assert len(counter.read_text(encoding="utf-8")) == 4
+    # And the sandbox really is usable when reset returns, which is the
+    # whole contract.
+    assert target.run_inside(["print('x')"], timeout=10).returncode == 0
+
+
+def test_reset_reports_a_sandbox_that_never_comes_back(tmp_path):
+    """A sandbox that never answers must not be reported as reset. The
+    reset command's own success is not evidence that anything came back."""
+    target, _counter = _counting_target(tmp_path, failures=1000)
+    result = target.reset(timeout=5)
+    assert result.returncode != 0
+    assert "did not accept an exec" in result.stderr
+
+
+def test_readiness_requires_an_exec_that_survives_a_moment(tmp_path):
+    """One exec that returns is not proof the sandbox is back.
+
+    `docker compose restart` returns before the container has stopped, so a
+    readiness check that only asks "does an exec succeed right now" gets its
+    answer from the container that is about to be killed. The next probe
+    then starts a long payload and loses it partway through. Readiness has
+    to ask the sandbox to still be there in a moment, not merely to answer.
+    """
+    target, _counter = _counting_target(tmp_path, failures=0)
+    recorded = tmp_path / "stdin"
+    script = tmp_path / "recording-exec.sh"
+    script.write_text(f'#!/bin/sh\ncat > "{recorded}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    object.__setattr__(target, "exec_command", [str(script)])
+    assert target.reset(timeout=30).returncode == 0
+    assert "sleep" in recorded.read_text(encoding="utf-8")
+
+
+def test_a_failed_reset_command_is_not_followed_by_a_wait(tmp_path):
+    """No point waiting for a sandbox nobody asked to restart."""
+    target, counter = _counting_target(tmp_path, failures=0)
+    object.__setattr__(target, "reset_command", ["false"])
+    result = target.reset(timeout=5)
+    assert result.returncode != 0
+    assert counter.read_text(encoding="utf-8") == ""
+
+
+def test_reset_without_a_reset_command_is_unchanged(tmp_path):
+    target = load_target(_write(tmp_path, _MINIMAL))
+    result = target.reset()
+    assert result.returncode == 1
+    assert "not configured" in result.stderr
+
+
 def test_loads_a_target_with_a_proxy(tmp_path):
     target = load_target(_write(tmp_path, dict(_MINIMAL, proxy="broker:3128")))
     assert target.proxy == "broker:3128"
