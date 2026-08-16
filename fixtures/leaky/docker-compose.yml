@@ -16,6 +16,20 @@ services:
     # no mem_limit, no pids_limit (invariant 4)
     # no user, no cap_drop, no read_only (invariants 2 and 3)
 
+  authorized:
+    image: python:3.12-alpine
+    command: ["python3", "-m", "http.server", "80"]
+    # Stands in for a host the sandbox is legitimately allowed to reach, and
+    # it is the network probe's positive control, not part of what is under
+    # test. With no broker in this stack the probe cannot prove liveness
+    # through a proxy the way it does against the reference, so it falls back
+    # to reaching `allowed_host` directly. That fallback needs a host that
+    # genuinely answers: a `.invalid` name is unreachable for everyone,
+    # including a wide-open sandbox, so pointing the control at one would
+    # make the probe report "nothing was measured" on the very fixture whose
+    # job is to prove the probe can measure. Same reasoning as
+    # `unauthorized` below, applied to the other side of the test.
+
   unauthorized:
     image: python:3.12-alpine
     command: ["python3", "-m", "http.server", "80"]

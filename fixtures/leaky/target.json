@@ -2,7 +2,7 @@
   "name": "leaky",
   "exec_command": ["docker", "compose", "-f", "fixtures/leaky/docker-compose.yml",
                    "exec", "-T", "sandbox", "python3", "-"],
-  "allowed_host": "example.invalid",
+  "allowed_host": "authorized",
   "blocked_host": "unauthorized",
   "c2_hosts": ["paste.invalid", "requestcapture.invalid", "filedrop.invalid"]
 }

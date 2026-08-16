@@ -31,7 +31,7 @@ some real deployment ships by default anyway.
   its full default capability set on a writable filesystem. Invariants 2
   and 3 fail together: an escape from this container is an escape as root.
 
-## The `unauthorized` service (amendment to the original brief)
+## The `authorized` and `unauthorized` services (amendments to the brief)
 
 The brief that shaped this fixture set `blocked_host` to a `.invalid` name,
 matching the reference target. That cannot demonstrate a leak: RFC 2606
@@ -48,10 +48,27 @@ in for a real external host that a contained sandbox has no business
 reaching. Because it is a Compose service name on a private network, not a
 public hostname, it is exempt from the `.invalid` convention that applies
 everywhere else in this repository; `target.json` points `blocked_host` at
-`unauthorized` for exactly this reason. `allowed_host` and `c2_hosts` stay
-as `.invalid` names, because those are supposed to stay unreachable, and a
-`.invalid` name reliably delivers that regardless of what the sandbox
-allows.
+`unauthorized` for exactly this reason.
+
+`authorized` is the same fix applied to the other side of the test, and it
+corrects an error in the first version of this fixture. That version left
+`allowed_host` as a `.invalid` name on the reasoning that everything except
+`blocked_host` should stay unreachable. That reasoning does not hold for
+`allowed_host`, because `allowed_host` is not another thing the sandbox
+should fail to reach: it is the network probe's **positive control**, the
+host the probe reaches in order to prove it can observe reachability at
+all. The reference sandbox proves that control through its broker. This
+stack has no broker, so the probe falls back to reaching `allowed_host`
+directly, and a `.invalid` name fails that fallback for everyone,
+contained or not. The result was a wide-open fixture reporting that the
+network probe "could not confirm it was testing a reachable target" in the
+same run where it reported a live TCP connection to `unauthorized`, which
+is both false and the wrong lesson. `c2_hosts` do stay `.invalid`: those
+are supposed to stay unreachable, and a `.invalid` name delivers that
+regardless of what the sandbox allows.
+
+Neither service is part of what is under test. Both exist so the probes'
+claims about this fixture can be checked rather than assumed.
 
 ## No broker, so no logs
 
