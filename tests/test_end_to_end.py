@@ -226,5 +226,5 @@ def test_subset_run_against_the_reference_never_claims_containment():
     completed = run_probe("--target", _REFERENCE_TARGET, "--probe", "credentials")
     assert completed.returncode == 2
     table = completed.stdout.decode()
-    assert "PARTIAL RUN: 1 of 6 probes selected (credentials)." in table
+    assert "PARTIAL RUN: 1 of 6 probes produced a result (credentials)." in table
     assert "CONTAINED" not in table

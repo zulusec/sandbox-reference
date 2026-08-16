@@ -7,10 +7,17 @@ findings must not.
 The word CONTAINED appears only when every registered probe ran and found
 nothing. A reader must never be able to mistake an incomplete run, or a run
 that only covered a subset of the registered probes, for a sandbox that
-held. to_table accepts the same metadata dict as to_json so it can tell a
-subset selection from a full one; metadata carrying probes_selected and
-probes_registered that disagree makes CONTAINED unreachable and names the
-subset instead.
+held.
+
+Which probes ran comes from the report, not from the metadata: report.probes_
+ran is the set that produced an outcome, while metadata's probes_selected is
+only what the caller intended. Coverage is judged by comparing what came
+back against the registered set, so a run that quietly produced fewer
+outcomes than were asked for cannot render as a full assessment no matter
+what the caller believed it was doing. Both renderers ask the same question
+of the same data: a table that refuses CONTAINED while the JSON beside it
+says complete is a report that lies to machines and tells the truth to
+people, and automation reads the JSON.
 """
 
 from __future__ import annotations
@@ -29,10 +36,18 @@ def findings_json(findings: Iterable[Finding]) -> str:
 
 
 def to_json(report: RunReport, metadata: dict) -> str:
+    gap = _coverage_gap(report, metadata)
     payload = {
         "metadata": dict(
             metadata,
-            complete=report.complete,
+            # complete carries both halves, because a consumer gating on
+            # `metadata.complete && !findings.length` is reading it as the
+            # JSON spelling of CONTAINED and must get the same answer the
+            # table gives. coverage_complete is separate so a reader can
+            # still tell a partial run from an errored one.
+            complete=report.complete and gap is None,
+            coverage_complete=gap is None,
+            probes_ran=sorted(report.probes_ran),
             errors=[error.to_dict() for error in report.errors],
             controls_failed=list(report.controls_failed),
         ),
@@ -42,41 +57,61 @@ def to_json(report: RunReport, metadata: dict) -> str:
 
 
 def to_table(report: RunReport, metadata: dict | None = None) -> str:
-    partial = _partial_selection(metadata)
+    gap = _coverage_gap(report, metadata)
     blocks = []
-    if partial is not None:
-        blocks.append(_partial_block(*partial))
+    if gap is not None:
+        blocks.append(_partial_block(*gap))
     if report.errors:
         blocks.append(_incomplete_block(report))
     if report.controls_failed:
         blocks.append(_control_block(report))
-    blocks.append(_findings_block(report, is_partial=partial is not None))
+    blocks.append(_findings_block(report, is_partial=gap is not None))
     return "\n".join(blocks)
 
 
-def _partial_selection(metadata: dict | None) -> tuple[list[str], list[str]] | None:
-    """None means full coverage (or no selection info at all); otherwise the
-    (selected, registered) probe id lists, for a selection that left probes
-    out."""
+def _coverage_gap(
+    report: RunReport, metadata: dict | None
+) -> tuple[list[str], list[str], list[str]] | None:
+    """None means full coverage, or no coverage information at all.
+
+    Otherwise (ran, registered, missing): the probes that produced an
+    outcome, the probes the tool knows about, and the probes the caller
+    selected that produced nothing. The last of those is the dangerous
+    case, because it is the one that cannot be explained by an operator
+    asking for a subset.
+    """
     if not metadata:
         return None
-    selected = metadata.get("probes_selected")
     registered = metadata.get("probes_registered")
-    if selected is None or registered is None:
+    if registered is None:
         return None
-    if set(selected) == set(registered):
+    ran = sorted(set(report.probes_ran))
+    selected = metadata.get("probes_selected")
+    missing = sorted(set(selected) - set(ran)) if selected is not None else []
+    if set(ran) == set(registered) and not missing:
         return None
-    return sorted(selected), sorted(registered)
+    return ran, sorted(registered), missing
 
 
-def _partial_block(selected: list[str], registered: list[str]) -> str:
-    names = ", ".join(selected)
-    return "\n".join([
-        f"PARTIAL RUN: {len(selected)} of {len(registered)} probes selected ({names}).",
+def _partial_block(ran: list[str], registered: list[str], missing: list[str]) -> str:
+    names = ", ".join(ran) if ran else "none"
+    lines = [
+        f"PARTIAL RUN: {len(ran)} of {len(registered)} probes produced a result ({names}).",
+    ]
+    if missing:
+        lines.append(
+            f"Selected but produced no outcome: {', '.join(missing)}. A probe "
+            "that was asked for and returned nothing is not a clean result."
+        )
+    unrun = sorted(set(registered) - set(ran) - set(missing))
+    if unrun:
+        lines.append(f"Not run: {', '.join(unrun)}.")
+    lines.extend([
         "This is not a full assessment. A pipeline must not read this run's",
         "exit code as containment.",
         "",
     ])
+    return "\n".join(lines)
 
 
 def _incomplete_block(report: RunReport) -> str:

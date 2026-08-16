@@ -4,10 +4,18 @@ A containment harness fails dangerously if a probe that could not run is
 indistinguishable from a probe that ran and found nothing. Both produce an
 empty finding list. Only the error list and the positive control tell them
 apart, so both travel with the findings everywhere they go.
+
+A probe that never ran at all produces neither, which is why the report also
+carries the ids of the probes that actually produced an outcome. Coverage is
+a measurement taken from the run, never an assumption carried over from
+whatever the caller intended to run: an intention that is never reconciled
+against the run is exactly how "every probe ran" gets printed under a run
+where none did.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from sandbox_probe.finding import Finding, sort_findings
@@ -53,10 +61,27 @@ class RunReport:
     findings: list[Finding]
     errors: list[ProbeError]
     controls_failed: list[str]
+    probes_ran: list[str] = field(default_factory=list)
+    """The ids of the probes that produced an outcome, sorted.
+
+    Not the ids of the probes somebody meant to run. A caller that wants to
+    know whether its selection was covered asks `covers`, which compares its
+    intention against this list rather than against itself.
+    """
 
     @property
     def complete(self) -> bool:
         return not self.errors and not self.controls_failed
+
+    def covers(self, expected: Iterable[str]) -> bool:
+        """Did every probe that was supposed to run produce an outcome.
+
+        Equality, not containment in either direction. A run short of what
+        was asked for is not a full assessment, and a run carrying an
+        outcome from a probe nobody selected is a harness this report has no
+        business vouching for either.
+        """
+        return set(expected) == set(self.probes_ran)
 
     @property
     def exit_code(self) -> int:
@@ -79,4 +104,5 @@ def merge_outcomes(outcomes: dict[str, ProbeOutcome]) -> RunReport:
         findings=sort_findings(findings),
         errors=errors,
         controls_failed=controls_failed,
+        probes_ran=sorted(outcomes),
     )

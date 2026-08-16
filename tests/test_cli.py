@@ -4,6 +4,7 @@ import pytest
 
 from sandbox_probe import cli
 from sandbox_probe.result import ProbeOutcome
+from sandbox_probe.runner import run_all
 
 
 class _FakeProbe:
@@ -135,6 +136,71 @@ def test_json_metadata_distinguishes_selected_from_registered(tmp_path, capsys, 
     assert exit_code == 2
     assert payload["metadata"]["probes_selected"] == ["alpha"]
     assert payload["metadata"]["probes_registered"] == ["alpha", "beta"]
+
+
+# --- Coverage is a measurement, not an intention.
+#
+# The CLI knows which probes it meant to run. That is not evidence that any
+# of them ran. These two drive the exact mutation the audit used, run_all
+# called with an empty probe list while the full set is selected, and pin
+# that neither renderer can call the result of it a clean full assessment.
+
+def _run_nothing(target, probes):
+    """run_all as the mutation left it: the selected probes never reach it."""
+    return run_all(target, [])
+
+
+def test_a_run_that_covered_no_probe_cannot_read_as_contained(
+    tmp_path, capsys, monkeypatch
+):
+    path = _write_stub_target(tmp_path)
+    fakes = [_FakeProbe("alpha"), _FakeProbe("beta")]
+    monkeypatch.setattr(cli, "all_probes", lambda: fakes)
+    monkeypatch.setattr(cli, "run_all", _run_nothing)
+
+    exit_code = cli.main(["--target", str(path)])
+    out = capsys.readouterr().out
+
+    assert exit_code == 2
+    assert "CONTAINED" not in out
+    assert "PARTIAL RUN" in out
+    # Named, not merely counted: a reader has to be able to see which probes
+    # were asked for and produced nothing.
+    assert "alpha" in out
+    assert "beta" in out
+
+
+def test_a_run_that_covered_no_probe_is_incomplete_in_the_json(
+    tmp_path, capsys, monkeypatch
+):
+    path = _write_stub_target(tmp_path)
+    fakes = [_FakeProbe("alpha"), _FakeProbe("beta")]
+    monkeypatch.setattr(cli, "all_probes", lambda: fakes)
+    monkeypatch.setattr(cli, "run_all", _run_nothing)
+
+    exit_code = cli.main(["--target", str(path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert payload["metadata"]["complete"] is False
+    assert payload["metadata"]["coverage_complete"] is False
+    assert payload["metadata"]["probes_ran"] == []
+
+
+def test_json_metadata_reports_the_probes_that_actually_ran(tmp_path, capsys, monkeypatch):
+    """probes_selected says what was asked for. probes_ran says what came
+    back. A consumer gating on containment needs the second one."""
+    path = _write_stub_target(tmp_path)
+    fakes = [_FakeProbe("alpha"), _FakeProbe("beta")]
+    monkeypatch.setattr(cli, "all_probes", lambda: fakes)
+
+    exit_code = cli.main(["--target", str(path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["metadata"]["probes_ran"] == ["alpha", "beta"]
+    assert payload["metadata"]["coverage_complete"] is True
+    assert payload["metadata"]["complete"] is True
 
 
 def test_json_metadata_lists_match_when_selection_is_full(tmp_path, capsys, monkeypatch):

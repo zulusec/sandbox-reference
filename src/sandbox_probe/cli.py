@@ -87,14 +87,17 @@ def main(argv: list[str] | None = None) -> int:
 
     registered_ids = {probe.probe_id for probe in registered}
     selected_ids = {probe.probe_id for probe in selected}
-    full_coverage = selected_ids == registered_ids
 
     report = run_all(target, selected)
-    # A run that did not cover every registered probe cannot claim exit 0
+    # Coverage is read out of the report, never out of the selection above.
+    # The selection is what this process intended; report.probes_ran is what
+    # actually produced an outcome, and only the second one is evidence. A
+    # run that did not cover every registered probe cannot claim exit 0
     # (assessed and contained), and the existing rule that 2 outranks 3
     # still holds: a partial run with findings also reports incomplete,
     # not findings-present, since the findings alone are not the full
     # picture either.
+    full_coverage = report.covers(registered_ids)
     exit_code = report.exit_code if full_coverage else EXIT_INCOMPLETE
 
     metadata = {

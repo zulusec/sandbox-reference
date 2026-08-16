@@ -45,6 +45,24 @@ def test_incomplete_outranks_findings():
     assert report.exit_code == 2
 
 
+def test_the_report_records_which_probes_produced_an_outcome():
+    """An empty finding list means nothing without the set of probes that
+    produced it. The report carries that set rather than leaving the caller
+    to assume its own selection ran."""
+    report = merge_outcomes({
+        "network": ProbeOutcome([], [], control_ok=True),
+        "bounds": ProbeOutcome([], [_error()], control_ok=True),
+    })
+    assert report.probes_ran == ["bounds", "network"]
+
+
+def test_a_report_covers_only_the_probes_that_produced_an_outcome():
+    report = merge_outcomes({"network": ProbeOutcome([], [], control_ok=True)})
+    assert report.covers(["network"])
+    assert not report.covers(["network", "bounds"])
+    assert not merge_outcomes({}).covers(["network"])
+
+
 def test_findings_are_sorted_across_probes():
     low = Finding(probe_id="a", subject="s", rule_key="k",
                   severity=Severity.LOW, title="t", evidence="e")
