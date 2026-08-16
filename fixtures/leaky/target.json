@@ -4,5 +4,7 @@
                    "exec", "-T", "sandbox", "python3", "-"],
   "allowed_host": "authorized",
   "blocked_host": "unauthorized",
+  "blocked_endpoint": "1.1.1.1:443",
+  "dns_canary_host": "example.com",
   "c2_hosts": ["paste.invalid", "requestcapture.invalid", "filedrop.invalid"]
 }

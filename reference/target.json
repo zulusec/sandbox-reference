@@ -10,6 +10,8 @@
                     "restart", "sandbox"],
   "allowed_host": "example.invalid",
   "blocked_host": "blocked.invalid",
+  "blocked_endpoint": "1.1.1.1:443",
+  "dns_canary_host": "example.com",
   "c2_hosts": ["paste.invalid", "requestcapture.invalid", "filedrop.invalid"],
   "proxy": "broker:3128",
   "wallclock_limit_seconds": 300
