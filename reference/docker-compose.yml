@@ -63,6 +63,15 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     pids_limit: 128
+    # Disposable means killable. The command here does not handle SIGTERM,
+    # so without this every stop waits out the full default grace period of
+    # ten seconds and then ends in a kill anyway: ten seconds of cost, the
+    # same outcome, and a ten second window in which the container is on its
+    # way down while still answering execs. Invariant 4 asks for a reset
+    # between tasks, and a reset should be the cheapest thing this stack
+    # does. Anything inside that deserves a graceful shutdown does not
+    # belong in a sandbox that is thrown away after every task.
+    stop_grace_period: 1s
     # A sandbox that is "started" is not yet a sandbox that can take work,
     # and `up --wait` needs something definite to wait on for every service
     # rather than only for the broker. Readiness here is simply that the
