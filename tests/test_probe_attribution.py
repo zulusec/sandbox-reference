@@ -410,3 +410,53 @@ def test_a_hostile_log_entry_cannot_write_control_characters_into_the_report():
     for finding in outcome.findings:
         assert "\x1b" not in finding.evidence
         assert "CONTAINED. Every probe ran" not in finding.evidence
+
+
+# --- Errors render to the same terminal findings do, and the target chooses
+# every byte of the stderr an error quotes. Both the exec and the request-log
+# read are such a channel.
+
+_STDERR_FORGERY = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_forged_exec_stderr_cannot_repaint_the_report():
+    target = _target(_BOTH_LOGGED)
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", _STDERR_FORGERY + "padding" * 900),
+    )
+    outcome = AttributionProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_a_forged_request_log_stderr_cannot_repaint_the_report():
+    target = _target(_BOTH_LOGGED)
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(0, "", "")
+        return ExecResult(1, "", _STDERR_FORGERY + "padding" * 900)
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = AttributionProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_an_enormous_non_dict_inner_result_is_bounded():
+    target = _target(_BOTH_LOGGED)
+    payload = f"{MARKER} {json.dumps('a' * 300000)}\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = AttributionProbe().run(target)
+    assert outcome.errors
+    assert len(outcome.errors[0].detail) < 500
+    assert not outcome.control_ok

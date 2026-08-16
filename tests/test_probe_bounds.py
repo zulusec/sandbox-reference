@@ -172,6 +172,51 @@ def test_a_failed_marker_write_is_never_a_clean_disposability_result():
     assert outcome.errors
 
 
+# --- Errors render to the same terminal findings do, and the target chooses
+# every byte of the stderr an error quotes. This probe has two such channels,
+# the exec and the reset command, and both reach the report.
+
+_FORGERY = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_forged_exec_stderr_cannot_repaint_the_report():
+    target = _target([_BOUNDED, _BOUNDED])
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", _FORGERY + "padding" * 900),
+    )
+    outcome = BoundsProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_a_forged_reset_stderr_cannot_repaint_the_report():
+    target = _target([_BOUNDED, _BOUNDED])
+    object.__setattr__(
+        target, "reset",
+        lambda timeout=60: ExecResult(1, "", _FORGERY + "padding" * 900),
+    )
+    outcome = BoundsProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_an_enormous_non_dict_inner_result_is_bounded():
+    target = _target([_BOUNDED, _BOUNDED])
+    payload = f"{MARKER} {json.dumps('a' * 300000)}\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = BoundsProbe().run(target)
+    assert outcome.errors
+    assert len(outcome.errors[0].detail) < 500
+    assert not outcome.control_ok
+
+
 def test_a_marker_left_by_an_earlier_run_is_not_attributed_to_this_one():
     """marker_present on the first exec means an earlier run left a marker
     behind. A marker surviving the reset then proves nothing about this

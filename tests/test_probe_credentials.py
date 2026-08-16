@@ -121,6 +121,37 @@ def test_a_credential_path_the_probe_never_asked_about_is_not_reported():
     assert [f for f in outcome.findings if f.rule_key == "credential_file"] == []
 
 
+# --- Errors render to the same terminal findings do, and everything an
+# error quotes came from the system under test too. stderr is the widest of
+# those channels: the target chooses every byte of it.
+
+def test_a_forged_stderr_cannot_repaint_the_report_through_an_error():
+    target = _target(_CLEAN)
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", _FORGERY + "padding" * 900),
+    )
+    outcome = CredentialsProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_an_enormous_non_dict_inner_result_is_bounded():
+    """parse_inner returns whatever json.loads produced. A 300,000 character
+    string is a valid JSON document and must not become a 300,000 character
+    error detail."""
+    target = _target(_CLEAN)
+    payload = f"{MARKER} {json.dumps('a' * 300000)}\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = CredentialsProbe().run(target)
+    assert outcome.errors
+    assert len(outcome.errors[0].detail) < 500
+    assert not outcome.control_ok
+
+
 def test_credential_paths_are_reported_in_the_harnesss_own_order():
     outcome = CredentialsProbe().run(_target(dict(
         _CLEAN, readable_paths=list(reversed(_CREDENTIAL_PATHS)))))

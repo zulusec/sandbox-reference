@@ -456,3 +456,72 @@ def test_a_hostile_severity_value_cannot_write_control_characters_into_the_repor
     # inside the sentence that says where it came from.
     assert finding.evidence.startswith("the event for blocked.invalid was raised at")
     assert finding.evidence.endswith("An alert nobody escalates is an alert nobody answers.")
+
+
+# --- Errors render to the same terminal findings do, and the target chooses
+# every byte of the stderr an error quotes. This probe reads three such
+# channels: the exec, the event channel, and the request log.
+
+_STDERR_FORGERY = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_forged_exec_stderr_cannot_repaint_the_report():
+    target = _target([_ALERT])
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", _STDERR_FORGERY + "padding" * 900),
+    )
+    outcome = DetectionProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_a_forged_event_channel_stderr_cannot_repaint_the_report():
+    target = _target([_ALERT])
+    calls = {"n": 0}
+
+    def read_events(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(0, "", "")
+        return ExecResult(1, "", _STDERR_FORGERY + "padding" * 900)
+
+    object.__setattr__(target, "read_events", read_events)
+    outcome = DetectionProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_a_forged_request_log_stderr_cannot_repaint_the_report():
+    target = _target([_ALERT])
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(0, "", "")
+        return ExecResult(1, "", _STDERR_FORGERY + "padding" * 900)
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = DetectionProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_an_enormous_non_dict_inner_result_is_bounded():
+    target = _target([_ALERT])
+    payload = f"{MARKER} {json.dumps('a' * 300000)}\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = DetectionProbe().run(target)
+    assert outcome.errors
+    assert len(outcome.errors[0].detail) < 500
+    assert not outcome.control_ok

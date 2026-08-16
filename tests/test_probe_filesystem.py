@@ -597,3 +597,30 @@ def test_a_huge_cleanup_list_is_bounded_and_the_remainder_is_counted():
 def test_a_non_list_path_result_is_not_walked_character_by_character():
     outcome = FilesystemProbe().run(_target(dict(_CLEAN, readable_outside="/etc/shadow")))
     assert outcome.findings == []
+
+
+def test_a_forged_stderr_cannot_repaint_the_report_through_an_error():
+    """stderr is the widest channel the target has into the report: it
+    chooses every byte of it, and the detail is written straight to the same
+    terminal a finding is."""
+    target = _target(_CLEAN)
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", _FORGERY + "padding" * 900),
+    )
+    outcome = FilesystemProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+    assert not outcome.control_ok
+
+
+def test_an_enormous_non_dict_inner_result_is_bounded():
+    target = _target(_CLEAN)
+    payload = f"{MARKER} {json.dumps('a' * 300000)}\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = FilesystemProbe().run(target)
+    assert outcome.errors
+    assert len(outcome.errors[0].detail) < 500
+    assert not outcome.control_ok

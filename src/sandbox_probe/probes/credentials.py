@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 
-from sandbox_probe.evidence import bounded, overflow_finding
+from sandbox_probe.evidence import bounded, overflow_finding, safe_text
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -135,12 +135,19 @@ def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     violation all collapse into the same message, "inner payload produced
     no marked result line", and an operator cannot tell a target-side
     problem from a probe-side one.
+
+    stderr is the widest channel the system under test has into this
+    report: it chooses every byte of it, and an error detail is written to
+    the same terminal a finding is. So it goes through the same cleaning
+    and the same length bound every other target-supplied value does.
+    Errors are not Findings, but they render identically, so the rule that
+    covers one has to cover the other.
     """
     detail = base
     if executed.returncode != 0:
         detail += f" (exit code {executed.returncode})"
     if executed.stderr.strip():
-        detail += f"; stderr: {executed.stderr.strip()}"
+        detail += f"; stderr: {safe_text(executed.stderr.strip())}"
     return detail
 
 
@@ -173,7 +180,7 @@ class CredentialsProbe:
             return ProbeOutcome(
                 errors=[ProbeError(
                     self.probe_id, target.name, "exec",
-                    f"inner result was not a JSON object: {inner!r}",
+                    f"inner result was not a JSON object: {safe_text(inner)}",
                 )],
                 control_ok=False,
             )
