@@ -104,6 +104,20 @@ def load_target(path: str | Path) -> Target:
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise TargetConfigError(f"{key} must be a list of strings")
 
+    for key in ("name", "allowed_host", "blocked_host"):
+        if not isinstance(raw[key], str):
+            raise TargetConfigError(f"{key} must be a string")
+
+    # A bare string here is the dangerous case, because it is accepted
+    # silently and measures nothing: list("paste.example") is thirteen
+    # single-character hostnames, none of which is the host the operator
+    # meant, and the c2 check then reports clean having probed thirteen
+    # names that do not exist. A config typo must fail loudly rather than
+    # produce a clean result from an unrun check.
+    c2_hosts = raw.get("c2_hosts", [])
+    if not isinstance(c2_hosts, list) or not all(isinstance(item, str) for item in c2_hosts):
+        raise TargetConfigError("c2_hosts must be a list of strings")
+
     proxy = raw.get("proxy")
     if proxy is not None and not isinstance(proxy, str):
         raise TargetConfigError("proxy must be a string")
@@ -122,7 +136,7 @@ def load_target(path: str | Path) -> Target:
         exec_command=raw["exec_command"],
         allowed_host=raw["allowed_host"],
         blocked_host=raw["blocked_host"],
-        c2_hosts=list(raw.get("c2_hosts", [])),
+        c2_hosts=list(c2_hosts),
         request_log_command=raw.get("request_log_command"),
         events_command=raw.get("events_command"),
         reset_command=raw.get("reset_command"),

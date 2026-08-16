@@ -27,3 +27,22 @@ def test_sort_is_independent_of_input_order():
     a = _finding(rule_key="a")
     b = _finding(rule_key="b")
     assert sort_findings([a, b]) == sort_findings([b, a])
+
+
+def test_sort_is_total_over_findings_that_share_every_grouping_key():
+    """rule_key is not unique: one key covers several distinct signals, and
+    the leaky fixture produces five findings sharing probe_id, subject,
+    rule_key and severity. Ordering only on those four leaves them to
+    Python's stable sort plus the order a probe happened to append them in,
+    which is determinism by coincidence. Determinism is a headline claim,
+    so the order has to come from the fields themselves."""
+    a = _finding(rule_key="outside_workspace", title="A", evidence="/etc was written")
+    b = _finding(rule_key="outside_workspace", title="A", evidence="/usr was written")
+    c = _finding(rule_key="outside_workspace", title="B", evidence="/host was listed")
+    assert sort_findings([c, b, a]) == sort_findings([a, b, c]) == [a, b, c]
+
+
+def test_findings_differing_only_in_evidence_still_have_distinct_sort_keys():
+    a = _finding(evidence="/etc")
+    b = _finding(evidence="/usr")
+    assert a.sort_key != b.sort_key

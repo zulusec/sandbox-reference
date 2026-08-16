@@ -22,6 +22,17 @@ _REGISTRY: dict[str, Probe] = {}
 
 
 def register(probe: Probe) -> Probe:
+    # A duplicate id must not overwrite the incumbent. The newcomer would
+    # replace it, the registry would still hold six ids, and every check
+    # that counts or names the registered probes would still pass while one
+    # probe had silently stopped running. A probe that never runs and a
+    # probe that ran and found nothing must never look the same.
+    if probe.probe_id in _REGISTRY:
+        raise ValueError(
+            f"a probe with id {probe.probe_id!r} is already registered. "
+            "Registering a second one would replace the first, and the "
+            "registry would still look complete."
+        )
     _REGISTRY[probe.probe_id] = probe
     return probe
 

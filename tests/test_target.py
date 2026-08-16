@@ -107,3 +107,52 @@ def test_non_object_config_is_a_config_error(tmp_path):
         load_target(path)
     assert str(path) in str(excinfo.value)
     assert "object" in str(excinfo.value)
+
+
+# --- A malformed config must fail loudly rather than measure nothing.
+#
+# The command keys have been validated from the start. These four never
+# were, and the failure they produce is this project's central one arriving
+# through the config door: a check that runs, finds nothing, and reports
+# clean, having never looked at the thing the operator meant.
+
+def test_c2_hosts_as_a_bare_string_is_rejected(tmp_path):
+    """The dangerous case. list("paste.example") is thirteen one-character
+    hostnames, none of which exists, so c2_channel would report clean
+    having never probed the host named in the config."""
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, c2_hosts="paste.example")))
+    assert "c2_hosts" in str(excinfo.value)
+
+
+def test_c2_hosts_must_hold_only_strings(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, c2_hosts=[1, 2])))
+    assert "c2_hosts" in str(excinfo.value)
+
+
+def test_c2_hosts_may_be_absent(tmp_path):
+    target = load_target(_write(tmp_path, {
+        key: value for key, value in _MINIMAL.items() if key != "c2_hosts"
+    }))
+    assert target.c2_hosts == []
+
+
+def test_name_must_be_a_string(tmp_path):
+    """name is the subject on every finding, so a dict here would end up
+    rendered into the report as one."""
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, name={"a": 1})))
+    assert "name" in str(excinfo.value)
+
+
+def test_allowed_host_must_be_a_string(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, allowed_host=5)))
+    assert "allowed_host" in str(excinfo.value)
+
+
+def test_blocked_host_must_be_a_string(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_host=["a", "b"])))
+    assert "blocked_host" in str(excinfo.value)

@@ -8,6 +8,7 @@ script twice, the way a reader running the README actually would.
 
 import json
 
+import pytest
 from conftest import PROBE_IDS, run_probe
 
 # Importing the CLI is what registers the probes: registration happens on
@@ -25,7 +26,7 @@ from sandbox_probe import (
     render,
 )
 from sandbox_probe.finding import Finding, Severity, sort_findings
-from sandbox_probe.probes import all_probes
+from sandbox_probe.probes import all_probes, register
 from sandbox_probe.result import ProbeOutcome, merge_outcomes
 
 _STABLE_KEYS = {"probe_id", "subject", "rule_key", "severity", "title", "evidence"}
@@ -81,3 +82,25 @@ def test_list_probes_names_every_registered_probe():
     completed = run_probe("--list-probes")
     assert completed.returncode == 0
     assert completed.stdout.decode().split() == sorted(PROBE_IDS)
+
+
+def test_registering_a_duplicate_probe_id_raises_rather_than_replacing():
+    """Silent replacement is the worst available outcome: the newcomer takes
+    the incumbent's place, the registry still holds six ids, and every check
+    that counts or names them still passes while one probe has stopped
+    running entirely. A contributor adding a seventh probe under an existing
+    id would see a green suite."""
+    class _Impostor:
+        probe_id = "network"
+
+        def run(self, target):  # pragma: no cover - never reached
+            raise AssertionError("the impostor must never be registered")
+
+    with pytest.raises(ValueError) as excinfo:
+        register(_Impostor())
+    assert "network" in str(excinfo.value)
+    # The incumbent is untouched, which is the half a passing id-set check
+    # would not have noticed.
+    registered = {probe.probe_id: probe for probe in all_probes()}
+    assert sorted(registered) == sorted(PROBE_IDS)
+    assert type(registered["network"]).__name__ == "NetworkProbe"

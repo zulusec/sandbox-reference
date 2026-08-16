@@ -43,11 +43,23 @@ class Finding:
 
     @property
     def sort_key(self) -> tuple:
+        """A total order over the fields, not a partial one.
+
+        rule_key is not unique within a probe: one key covers several
+        distinct signals, and the leaky fixture produces five findings that
+        share probe_id, subject, rule_key and severity. Ordering only on
+        those four leaves those five to Python's stable sort plus whatever
+        order the probe happened to append them in, which is determinism by
+        coincidence rather than by construction. title and evidence are the
+        fields that actually distinguish them, so they are in the key.
+        """
         return (
             _SEVERITY_RANK[self.severity],
             self.probe_id,
             self.subject,
             self.rule_key,
+            self.title,
+            self.evidence,
         )
 
 
