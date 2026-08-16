@@ -50,6 +50,10 @@ def to_json(report: RunReport, metadata: dict) -> str:
             probes_ran=sorted(report.probes_ran),
             errors=[error.to_dict() for error in report.errors],
             controls_failed=list(report.controls_failed),
+            # A probe with no positive control is not a probe whose control
+            # passed. Naming the absence is what lets a reader tell them
+            # apart without reading the source.
+            controls_absent=list(report.controls_absent),
         ),
         "findings": [finding.to_dict() for finding in report.findings],
     }

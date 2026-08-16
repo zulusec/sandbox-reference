@@ -45,6 +45,23 @@ def test_incomplete_outranks_findings():
     assert report.exit_code == 2
 
 
+def test_an_absent_control_is_neither_a_pass_nor_a_failure():
+    report = merge_outcomes({
+        "credentials": ProbeOutcome([], [], control_ok=None),
+        "network": ProbeOutcome([], [], control_ok=True),
+        "bounds": ProbeOutcome([], [], control_ok=False),
+    })
+    assert report.controls_absent == ["credentials"]
+    assert report.controls_failed == ["bounds"]
+    assert report.exit_code == 2
+
+
+def test_a_run_whose_only_unusual_control_is_absent_is_still_complete():
+    report = merge_outcomes({"credentials": ProbeOutcome([], [], control_ok=None)})
+    assert report.complete
+    assert report.exit_code == 0
+
+
 def test_the_report_records_which_probes_produced_an_outcome():
     """An empty finding list means nothing without the set of probes that
     produced it. The report carries that set rather than leaving the caller

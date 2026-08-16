@@ -11,7 +11,11 @@ secret-shaped check runs inside the target process, on `_LOOKS_SECRET_SOURCE`
 below, and only variable names come back on the wire.
 
 This probe needs no positive control. Absence of a secret is directly
-observable in a way that absence of egress is not.
+observable in a way that absence of egress is not. That is a design
+decision rather than a control that passed, so it is reported as one: the
+outcome carries control_ok=None and the run's JSON lists this probe under
+controls_absent. What a reader must never be handed is a True standing in
+for a confirmation nobody performed.
 """
 
 from __future__ import annotations
@@ -310,7 +314,14 @@ class CredentialsProbe:
                 ),
             ))
 
-        return ProbeOutcome(findings=findings, control_ok=True)
+        # None, not True. This probe has no positive control: absence of a
+        # secret is directly observable in a way that absence of egress is
+        # not, so there is no separate check to run. A hardcoded True would
+        # be an affirmative claim that a control confirmed this probe was
+        # measuring something, and none did. The report names the absence
+        # instead, and a reader can tell "no control needed here" from "the
+        # control ran and held".
+        return ProbeOutcome(findings=findings, control_ok=None)
 
 
 register(CredentialsProbe())

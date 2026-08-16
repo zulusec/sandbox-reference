@@ -152,8 +152,14 @@ def test_reference_sandbox_ran_every_probe_and_every_control_held(reference_run)
     metadata = payload["metadata"]
     assert metadata["probes_selected"] == sorted(PROBE_IDS)
     assert metadata["probes_registered"] == sorted(PROBE_IDS)
+    assert metadata["probes_ran"] == sorted(PROBE_IDS)
+    assert metadata["coverage_complete"] is True
     assert metadata["errors"] == []
     assert metadata["controls_failed"] == []
+    # Exactly one probe declares no positive control, and it says so rather
+    # than reporting one that passed. A second name appearing here means a
+    # probe quietly stopped confirming it was measuring something.
+    assert metadata["controls_absent"] == ["credentials"]
 
 
 def test_reference_sandbox_stays_clean_on_a_second_consecutive_run(

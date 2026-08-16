@@ -39,6 +39,17 @@ def test_to_json_reports_incompleteness_in_metadata():
     assert payload["metadata"]["errors"][0]["operation"] == "exec"
 
 
+def test_to_json_distinguishes_an_absent_control_from_a_passed_one():
+    """A probe that has no positive control and a probe whose control ran
+    and held are two different things, and only one of them is evidence
+    that the probe was measuring something."""
+    report = merge_outcomes({"credentials": ProbeOutcome(control_ok=None)})
+    payload = json.loads(render.to_json(report, {}))
+    assert payload["metadata"]["controls_absent"] == ["credentials"]
+    assert payload["metadata"]["controls_failed"] == []
+    assert payload["metadata"]["complete"] is True
+
+
 def test_to_json_reports_failed_controls():
     payload = json.loads(render.to_json(_report(control_ok=False), {}))
     assert payload["metadata"]["controls_failed"] == ["network"]

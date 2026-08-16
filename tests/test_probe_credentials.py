@@ -7,6 +7,7 @@ from sandbox_probe.probes.credentials import (
     CredentialsProbe,
     looks_secret,
 )
+from sandbox_probe.result import merge_outcomes
 from sandbox_probe.target import ExecResult, Target
 
 
@@ -79,9 +80,28 @@ def test_imds_token_obtained_adds_the_hop_limit_finding():
     assert keys == {"imds_reachable", "imds_hop_limit"}
 
 
-def test_credential_probe_needs_no_positive_control():
-    """Absence of secrets is directly observable, unlike absence of egress."""
-    assert CredentialsProbe().run(_target(_CLEAN)).control_ok
+def test_credential_probe_reports_its_control_as_absent_not_as_passed():
+    """Absence of secrets is directly observable, unlike absence of egress,
+    so this probe has no positive control. It says so rather than reporting
+    a control that passed: a hardcoded True is a claim that the probe
+    confirmed it was measuring something, and nothing here confirmed that.
+    A reader has to be able to tell "no control needed" from "the control
+    ran and held"."""
+    outcome = CredentialsProbe().run(_target(_CLEAN))
+    assert outcome.control_ok is None
+    assert outcome.errors == []
+
+
+def test_a_probe_with_no_control_does_not_fail_the_run():
+    """Absent is not failed. This probe measures what it claims to measure;
+    what it does not have is a separate check confirming the measurement
+    was possible."""
+    outcome = CredentialsProbe().run(_target(_CLEAN))
+    report = merge_outcomes({"credentials": outcome})
+    assert report.controls_absent == ["credentials"]
+    assert report.controls_failed == []
+    assert report.complete
+    assert report.exit_code == 0
 
 
 # --- inner comes from the system under test, and evidence goes to a

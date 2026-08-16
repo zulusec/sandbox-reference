@@ -46,14 +46,22 @@ class ProbeError:
 class ProbeOutcome:
     """What one probe produced.
 
-    control_ok is the positive control. A network probe that reports no
-    egress because the harness could not reach the target at all has proved
-    nothing, and must not be counted as containment.
+    control_ok is the positive control: True when it ran and held, False
+    when it ran and did not. A network probe that reports no egress because
+    the harness could not reach the target at all has proved nothing, and
+    must not be counted as containment.
+
+    None is the third answer, and it is not a synonym for True. It means
+    this probe has no positive control at all, which is a defensible design
+    decision for a probe whose measurement is directly observable, but it is
+    a different claim from "the control ran and passed". Reporting the
+    second where the first is true is how a report ends up asserting a
+    confirmation nobody performed.
     """
 
     findings: list[Finding] = field(default_factory=list)
     errors: list[ProbeError] = field(default_factory=list)
-    control_ok: bool = True
+    control_ok: bool | None = True
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,15 @@ class RunReport:
     findings: list[Finding]
     errors: list[ProbeError]
     controls_failed: list[str]
+    controls_absent: list[str] = field(default_factory=list)
+    """Probes that report having no positive control, sorted.
+
+    Separate from controls_failed because they mean opposite things: a
+    failed control makes the run incomplete, while an absent one is a
+    property of the probe's design. Kept out of the completeness rule and
+    reported anyway, so a reader of the JSON can tell the two apart instead
+    of being handed a True that reads as a confirmation.
+    """
     probes_ran: list[str] = field(default_factory=list)
     """The ids of the probes that produced an outcome, sorted.
 
@@ -94,15 +111,22 @@ def merge_outcomes(outcomes: dict[str, ProbeOutcome]) -> RunReport:
     findings: list[Finding] = []
     errors: list[ProbeError] = []
     controls_failed: list[str] = []
+    controls_absent: list[str] = []
     for probe_id in sorted(outcomes):
         outcome = outcomes[probe_id]
         findings.extend(outcome.findings)
         errors.extend(outcome.errors)
-        if not outcome.control_ok:
+        # Identity, not truthiness. None is falsy in Python, and reading it
+        # as a failure here would turn "this probe has no control" into
+        # "this probe's control did not hold" for every run.
+        if outcome.control_ok is False:
             controls_failed.append(probe_id)
+        elif outcome.control_ok is None:
+            controls_absent.append(probe_id)
     return RunReport(
         findings=sort_findings(findings),
         errors=errors,
         controls_failed=controls_failed,
+        controls_absent=controls_absent,
         probes_ran=sorted(outcomes),
     )
