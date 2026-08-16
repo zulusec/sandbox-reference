@@ -36,7 +36,14 @@ nothing.
 
 from __future__ import annotations
 
-from sandbox_probe.evidence import bounded, overflow_finding
+from sandbox_probe.evidence import (
+    BOOL,
+    TEXT,
+    bounded,
+    overflow_finding,
+    safe_text,
+    shape_problem_detail,
+)
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -48,6 +55,22 @@ _TIMEOUT = 60
 # The two answers the address-literal check is allowed to give. Anything
 # else means it did not run.
 _MEASURED = ("connected", "denied")
+
+# What the payload has to answer, and in what shape. Every measurement below
+# is read with a falsy default, so a key that never arrived would produce
+# exactly what a check reporting no egress produces. Declaring the shape is
+# what keeps a missing answer an error rather than a clean line.
+#
+# c2 is not here because it is a mapping and the declared shapes do not
+# cover one. Its own guard is _as_mapping, and a c2 result of the wrong
+# shape can only lose findings, never manufacture the clean verdict, which
+# blocked_endpoint alone carries.
+_RESULT_SHAPE = {
+    "blocked_endpoint": TEXT,
+    "blocked_host": TEXT,
+    "dns_canary": TEXT,
+    "control_reachable": BOOL,
+}
 
 PAYLOAD_BODY = """
 def reachable(host, port=80, timeout=3):
@@ -172,12 +195,19 @@ def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     violation all collapse into the same message, "inner payload produced
     no marked result line", and an operator cannot tell a target-side
     problem from a probe-side one.
+
+    stderr is the widest channel the system under test has into this
+    report: it chooses every byte of it, and an error detail is written to
+    the same terminal a finding is. So it goes through the same cleaning
+    and the same length bound every other target-supplied value does.
+    Errors are not Findings, but they render identically, so the rule that
+    covers one has to cover the other.
     """
     detail = base
     if executed.returncode != 0:
         detail += f" (exit code {executed.returncode})"
     if executed.stderr.strip():
-        detail += f"; stderr: {executed.stderr.strip()}"
+        detail += f"; stderr: {safe_text(executed.stderr.strip())}"
     return detail
 
 
@@ -224,8 +254,15 @@ class NetworkProbe:
             return ProbeOutcome(
                 errors=[ProbeError(
                     self.probe_id, target.name, "exec",
-                    f"inner result was not a JSON object: {inner!r}",
+                    f"inner result was not a JSON object: {safe_text(inner)}",
                 )],
+                control_ok=False,
+            )
+
+        problem = shape_problem_detail(inner, _RESULT_SHAPE)
+        if problem is not None:
+            return ProbeOutcome(
+                errors=[ProbeError(self.probe_id, target.name, "result", problem)],
                 control_ok=False,
             )
 

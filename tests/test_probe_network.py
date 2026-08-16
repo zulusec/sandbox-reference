@@ -87,7 +87,35 @@ def test_a_missing_address_literal_result_is_an_error_not_a_pass():
     del inner["blocked_endpoint"]
     outcome = NetworkProbe().run(_target(inner))
     assert outcome.errors
-    assert outcome.errors[0].operation == "blocked_endpoint"
+    assert "blocked_endpoint is missing" in outcome.errors[0].detail
+    assert not outcome.control_ok
+    assert outcome.findings == []
+
+
+# --- A key that never arrived must not read as a check that came back no.
+#
+# Every measurement below is read out of the result dict, and every read has
+# a falsy default. Without a declared shape, a payload that simply omits
+# dns_canary produces exactly what a payload reporting no DNS egress
+# produces, which is this project's central failure arriving through the
+# protocol door rather than the config door.
+
+def test_a_missing_measurement_is_an_error_not_a_clean_result():
+    inner = _inner()
+    del inner["dns_canary"]
+    outcome = NetworkProbe().run(_target(inner))
+    assert outcome.errors
+    assert "dns_canary is missing" in outcome.errors[0].detail
+    assert not outcome.control_ok
+
+
+def test_a_measurement_of_the_wrong_type_is_an_error_not_a_clean_result():
+    outcome = NetworkProbe().run(_target(_inner(blocked_host=1, control_reachable="yes")))
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "blocked_host is int" in detail
+    assert "control_reachable is str" in detail
+    assert outcome.findings == []
 
 
 def test_an_address_literal_that_needed_dns_is_an_error_not_a_pass():
@@ -192,6 +220,41 @@ def test_exec_failure_detail_includes_returncode_and_stderr():
     detail = outcome.errors[0].detail
     assert "124" in detail
     assert "timed out after 60s" in detail
+
+
+def test_target_stderr_is_cleaned_and_bounded_before_it_reaches_the_report():
+    """An error detail renders to the same terminal a finding does.
+
+    stderr is the widest channel the system under test has into this report,
+    because it chooses every byte of it. An escape sequence here would clear
+    the operator's screen and repaint the run as a clean one, which is the
+    forgery the evidence module exists to prevent. Findings from this probe
+    already go through safe_text; errors were the way around it.
+    """
+    hostile = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings." + "x" * 5000
+    target = _target({})
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(1, "", hostile),
+    )
+    outcome = NetworkProbe().run(target)
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
+
+
+def test_a_non_dict_inner_result_is_cleaned_and_bounded_too():
+    """The other interpolation of a target-supplied value into an error."""
+    target = _target({})
+    payload = f'{MARKER} "\\u001b[2J{"y" * 5000}"\n'
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(0, payload, ""),
+    )
+    outcome = NetworkProbe().run(target)
+    detail = outcome.errors[0].detail
+    assert "\x1b" not in detail
+    assert len(detail) < 500
 
 
 def test_non_dict_inner_result_is_an_error_not_a_crash():
