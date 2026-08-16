@@ -525,3 +525,50 @@ def test_an_enormous_non_dict_inner_result_is_bounded():
     assert outcome.errors
     assert len(outcome.errors[0].detail) < 500
     assert not outcome.control_ok
+
+
+# --- The request-log baseline is what scopes the separation check to this
+# run's window. A baseline that could not be read leaves no window, and an
+# unmeasured separation check that reads like a correctly separated one is
+# the failure mode this probe's own docstring exists to rule out.
+
+def test_a_failed_request_log_baseline_does_not_open_the_gate_onto_the_whole_log():
+    """Stale allow and deny entries from an earlier run used to satisfy the
+    window check when the baseline read failed, so the separation check ran
+    against a window that was not this run's."""
+    stale = [_ALLOW_ENTRY, _DENY_ENTRY]
+    target = _target([_ALERT, dict(_ALERT, host="allowed.invalid")], request_delta=[])
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(1, "", "could not read the log")
+        return ExecResult(0, "\n".join(json.dumps(entry) for entry in stale), "")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = DetectionProbe().run(target)
+
+    assert "channel_not_separated" not in _keys(outcome)
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "baseline" in outcome.errors[0].detail
+
+
+def test_a_failed_request_log_baseline_keeps_the_findings_already_proved():
+    """The events-side findings come from the events delta alone and must
+    not be discarded because a secondary, request-log-backed check could not
+    be evaluated."""
+    target = _target([], request_delta=[])
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        return ExecResult(1, "", "could not read the log")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = DetectionProbe().run(target)
+
+    assert "violation_unalerted" in _keys(outcome)
+    assert outcome.errors
+    assert outcome.control_ok is False

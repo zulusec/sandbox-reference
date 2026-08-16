@@ -58,6 +58,17 @@ skipped. An unmeasured separation check that reads the same as a correctly
 separated one is exactly the false-clean failure mode this project exists
 to rule out.
 
+A failed read of the request log's baseline is the same case wearing a
+different hat, and it is not forgiven the way the event channel's baseline
+is. Forgiving it means treating zero prior lines as the truth, which makes
+the comparison window the whole log rather than this run's, and a stale
+allow-and-deny pair from an earlier run is then enough to open a gate onto
+data this run did not produce. That is a gate rather than a guard, so a
+baseline that could not be read reports the separation check as unevaluated
+and fails the positive control. It costs a running of this check against a
+target whose log genuinely does not exist yet, which is the right side to
+err on.
+
 Findings already proved from the events delta (violation_unalerted,
 severity_understated) are computed before the request log is ever touched
 a second time, and they are returned alongside any request-log-side error
@@ -221,11 +232,21 @@ class DetectionProbe:
         events_before = target.read_events()
         events_before_lines = _lines(events_before.stdout) if events_before.returncode == 0 else []
 
+        # The request-log baseline is different from the event channel's,
+        # and forgiving a failed read of it the same way would be a gate
+        # rather than a guard. request_before_lines is what scopes the
+        # separation check to this run's window; treating a failed read as
+        # zero prior lines makes the window the whole log, and a stale
+        # allow-or-deny pair from an earlier run then satisfies a check that
+        # has nothing to do with this run. So the failure is recorded and
+        # surfaced below, where the check that depends on it is evaluated.
         request_configured = target.request_log_command is not None
+        request_baseline_read = True
         request_before_lines: list[str] = []
         if request_configured:
             request_before = target.read_request_log()
-            if request_before.returncode == 0:
+            request_baseline_read = request_before.returncode == 0
+            if request_baseline_read:
                 request_before_lines = _lines(request_before.stdout)
 
         hosts = [target.allowed_host, target.blocked_host]
@@ -335,6 +356,24 @@ class DetectionProbe:
 
         if not request_configured:
             return ProbeOutcome(findings=findings, control_ok=True)
+
+        if not request_baseline_read:
+            # No baseline means no window, and no window means the lines
+            # this check would compare against are not known to be this
+            # run's. The events-side findings above are already proved and
+            # ride along.
+            return ProbeOutcome(
+                findings=findings,
+                errors=[ProbeError(
+                    self.probe_id, target.name, "channel_separation",
+                    "the request log's baseline could not be read before this run's "
+                    "violation, so the lines it holds now cannot be told apart from "
+                    "the ones an earlier run left behind. The channel separation "
+                    "check was not evaluated rather than evaluated against a window "
+                    "that is not this run's.",
+                )],
+                control_ok=False,
+            )
 
         request_after = target.read_request_log()
         if request_after.returncode != 0:
