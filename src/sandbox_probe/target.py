@@ -12,12 +12,25 @@ harness never has to quote code through someone else's exec wrapper.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 _REQUIRED = ("name", "exec_command", "allowed_host", "blocked_host")
+
+# An address literal, so the check that carries invariant 1 needs no name
+# resolution and therefore has no vacuous failure mode. 1.1.1.1:443 is a
+# public anycast address that answers TLS from anywhere with a route out,
+# which makes "the connection opened" mean "this sandbox has ambient
+# network" and nothing else.
+DEFAULT_BLOCKED_ENDPOINT = "1.1.1.1:443"
+
+# A name reserved by IANA for documentation that nonetheless has real A and
+# AAAA records, so it resolves for anything with DNS egress and belongs to
+# nobody who could be surprised by the lookup.
+DEFAULT_DNS_CANARY_HOST = "example.com"
 
 
 class TargetConfigError(Exception):
@@ -37,6 +50,8 @@ class Target:
     exec_command: list[str]
     allowed_host: str
     blocked_host: str
+    blocked_endpoint: str = DEFAULT_BLOCKED_ENDPOINT
+    dns_canary_host: str = DEFAULT_DNS_CANARY_HOST
     c2_hosts: list[str] = field(default_factory=list)
     request_log_command: list[str] | None = None
     events_command: list[str] | None = None
@@ -79,6 +94,45 @@ def _run(command: list[str], stdin: str | None, timeout: int) -> ExecResult:
     except OSError as error:
         return ExecResult(returncode=125, stdout="", stderr=f"could not exec: {error}")
     return ExecResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def _validate_blocked_endpoint(value: object) -> str:
+    """An `IP:port` literal, or a config error naming the key.
+
+    A hostname is refused rather than accepted, because accepting one would
+    put name resolution back in front of the one check that is supposed to
+    survive without it. If the name did not exist, the connection would fail
+    the same way it fails for a sandbox with no route, and the probe would
+    once again be unable to tell an enforced boundary from a name nobody
+    ever registered.
+    """
+    if not isinstance(value, str):
+        raise TargetConfigError("blocked_endpoint must be a string")
+    if value.startswith("["):
+        address, _, rest = value[1:].partition("]")
+        port_text = rest[1:] if rest.startswith(":") else ""
+    else:
+        address, separator, port_text = value.rpartition(":")
+        if not separator:
+            address, port_text = "", ""
+    try:
+        ipaddress.ip_address(address)
+    except ValueError as error:
+        raise TargetConfigError(
+            f"blocked_endpoint must be an address literal and a port, "
+            f"as in {DEFAULT_BLOCKED_ENDPOINT}, not {value!r}: {error}"
+        ) from error
+    if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        raise TargetConfigError(
+            f"blocked_endpoint must end in a port between 1 and 65535, not {value!r}"
+        )
+    return value
+
+
+def _validate_dns_canary_host(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise TargetConfigError("dns_canary_host must be a non-empty string")
+    return value
 
 
 def load_target(path: str | Path) -> Target:
@@ -136,6 +190,12 @@ def load_target(path: str | Path) -> Target:
         exec_command=raw["exec_command"],
         allowed_host=raw["allowed_host"],
         blocked_host=raw["blocked_host"],
+        blocked_endpoint=_validate_blocked_endpoint(
+            raw.get("blocked_endpoint", DEFAULT_BLOCKED_ENDPOINT)
+        ),
+        dns_canary_host=_validate_dns_canary_host(
+            raw.get("dns_canary_host", DEFAULT_DNS_CANARY_HOST)
+        ),
         c2_hosts=list(c2_hosts),
         request_log_command=raw.get("request_log_command"),
         events_command=raw.get("events_command"),

@@ -156,3 +156,82 @@ def test_blocked_host_must_be_a_string(tmp_path):
     with pytest.raises(TargetConfigError) as excinfo:
         load_target(_write(tmp_path, dict(_MINIMAL, blocked_host=["a", "b"])))
     assert "blocked_host" in str(excinfo.value)
+
+
+# --- The address literal the network probe cannot fail to measure.
+#
+# Every name-based check has a vacuous failure mode: a name that does not
+# exist is unreachable for a contained sandbox and for a wide open one
+# alike. blocked_endpoint has no such mode, because there is no name in it.
+# That is only true if the config guarantees it holds an address literal and
+# a port, so the guarantee is enforced here rather than assumed.
+
+def test_blocked_endpoint_defaults_to_a_public_address_literal(tmp_path):
+    target = load_target(_write(tmp_path, _MINIMAL))
+    assert target.blocked_endpoint == "1.1.1.1:443"
+
+
+def test_blocked_endpoint_may_be_overridden(tmp_path):
+    target = load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="192.0.2.9:80")))
+    assert target.blocked_endpoint == "192.0.2.9:80"
+
+
+def test_blocked_endpoint_accepts_a_bracketed_ipv6_literal(tmp_path):
+    target = load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="[2001:db8::1]:443")))
+    assert target.blocked_endpoint == "[2001:db8::1]:443"
+
+
+def test_blocked_endpoint_rejects_a_hostname(tmp_path):
+    """A hostname here would reintroduce the defect this key exists to close:
+    the check would need DNS, and an unresolvable name would read as a denied
+    route."""
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="blocked.invalid:443")))
+    assert "blocked_endpoint" in str(excinfo.value)
+
+
+def test_blocked_endpoint_rejects_a_missing_port(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="1.1.1.1")))
+    assert "blocked_endpoint" in str(excinfo.value)
+
+
+def test_blocked_endpoint_rejects_a_port_out_of_range(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="1.1.1.1:70000")))
+    assert "blocked_endpoint" in str(excinfo.value)
+
+
+def test_blocked_endpoint_rejects_an_empty_string(tmp_path):
+    """An empty value must not silently disable the one check that has no
+    vacuous failure mode."""
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint="")))
+    assert "blocked_endpoint" in str(excinfo.value)
+
+
+def test_blocked_endpoint_must_be_a_string(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, blocked_endpoint=443)))
+    assert "blocked_endpoint" in str(excinfo.value)
+
+
+# --- The DNS canary needs a name that genuinely resolves somewhere.
+
+def test_dns_canary_host_defaults_to_a_name_that_resolves_on_the_open_internet(tmp_path):
+    target = load_target(_write(tmp_path, _MINIMAL))
+    assert target.dns_canary_host == "example.com"
+
+
+def test_dns_canary_host_may_be_overridden(tmp_path):
+    target = load_target(_write(tmp_path, dict(_MINIMAL, dns_canary_host="example.net")))
+    assert target.dns_canary_host == "example.net"
+
+
+def test_dns_canary_host_must_be_a_non_empty_string(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, dns_canary_host="")))
+    assert "dns_canary_host" in str(excinfo.value)
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, dns_canary_host=["example.com"])))
+    assert "dns_canary_host" in str(excinfo.value)
