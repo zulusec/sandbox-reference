@@ -18,7 +18,14 @@ from __future__ import annotations
 
 import json
 
-from sandbox_probe.evidence import bounded, overflow_finding, safe_text
+from sandbox_probe.evidence import (
+    LIST,
+    TEXT,
+    bounded,
+    overflow_finding,
+    safe_text,
+    shape_problem_detail,
+)
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -26,6 +33,23 @@ from sandbox_probe.result import ProbeError, ProbeOutcome
 from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
+
+# Every key PAYLOAD_BODY below fills in, and the shape each has to arrive
+# in. All three are read with a falsy default further down, so a result
+# missing one of them would read as "no secrets, no readable credential
+# files, metadata service unreachable" from a payload that measured none of
+# it.
+_RESULT_SHAPE = {
+    "env_secrets": LIST,
+    "readable_paths": LIST,
+    "imds": TEXT,
+}
+
+# The three states imds_state() can return. A fourth value, a misspelling,
+# or a different case falls through both branches below in silence, and
+# 'unreachable' is the good outcome, so an undefined state must never be
+# allowed to stand in for it.
+_IMDS_STATES = ("token_blocked", "token_obtained", "unreachable")
 
 _CREDENTIAL_PATHS = (
     "/var/run/secrets/kubernetes.io/serviceaccount/token",
@@ -185,12 +209,29 @@ class CredentialsProbe:
                 control_ok=False,
             )
 
+        # Before any measurement is read out of it. Nothing has been
+        # computed yet at this point, so returning here throws no proved
+        # finding away.
+        problem = shape_problem_detail(inner, _RESULT_SHAPE)
+        if problem is None and inner["imds"] not in _IMDS_STATES:
+            problem = (
+                "the payload reported a metadata-service state this probe does not "
+                f"define: {safe_text(inner['imds'])}. The three it defines are "
+                f"{', '.join(_IMDS_STATES)}, and a fourth cannot be read as any of "
+                "them, least of all as the one that means the endpoint was not there"
+            )
+        if problem is not None:
+            return ProbeOutcome(
+                errors=[ProbeError(self.probe_id, target.name, "result", problem)],
+                control_ok=False,
+            )
+
         findings = []
         # Variable names are genuinely discovered inside the sandbox, so
         # there is no harness-side list to check them against. They are
         # cleaned and bounded instead: inner comes from the system under
         # test, and a report is written to an operator's terminal.
-        names, dropped_names = bounded(inner.get("env_secrets"))
+        names, dropped_names = bounded(inner["env_secrets"])
         for name in names:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="env_secret",
@@ -212,10 +253,8 @@ class CredentialsProbe:
         # not an answer to anything this probe asked. Checking the reported
         # set against the list the harness sent keeps the report to paths
         # this harness named.
-        raw_paths = inner.get("readable_paths")
         reported = {
-            item for item in (raw_paths if isinstance(raw_paths, list) else [])
-            if isinstance(item, str)
+            item for item in inner["readable_paths"] if isinstance(item, str)
         }
         for path in _CREDENTIAL_PATHS:
             if path not in reported:
@@ -234,7 +273,7 @@ class CredentialsProbe:
         # imds_hop_limit. 'token_blocked' means the endpoint is routable but
         # the hop limit stopped the token response, so it raises
         # imds_reachable only.
-        imds = inner.get("imds", "unreachable")
+        imds = inner["imds"]
         if imds == "token_obtained":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="imds_reachable",

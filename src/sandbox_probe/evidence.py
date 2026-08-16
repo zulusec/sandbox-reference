@@ -25,8 +25,18 @@ voice.
 Nothing is dropped silently. A truncated string says what it was truncated
 from, a cleaned string says how many characters were removed, and a capped
 list hands back the number of values that did not fit so the caller can
-report that count rather than swallow it. A thing quietly removed from a
-report is, to whoever reads the report, a thing that was never measured.
+report that count rather than swallow it. A value that is not the shape the
+probe asked for raises rather than returning an empty result, because a
+value quietly removed from a report is, to whoever reads the report, a
+thing that was never measured.
+
+The same rule applies one level up, to the result dict itself. Every probe
+reads its measurements out of that dict with a falsy default, so a key that
+is absent, null, or the wrong type is indistinguishable from a key that came
+back negative: a missing key reads as an invariant that held. shape_problem_
+detail is where a probe declares the keys it asked for and the shape each one
+has to arrive in, so a result that does not answer the question becomes an
+error rather than a clean verdict.
 """
 
 from __future__ import annotations
@@ -43,6 +53,25 @@ TEXT_LIMIT = 200
 # the rest are summarized as a count. The same bound covers the filesystem
 # probe's uid list, so there is one number rather than one per probe.
 LIST_LIMIT = 16
+
+# The shapes a probe can declare a payload result key must arrive in. They
+# are phrases rather than types because they are written into an error an
+# operator reads, and because COUNT is not a type: a count excludes bools,
+# which subclass int in Python, and excludes negatives.
+BOOL = "a boolean"
+COUNT = "a non-negative whole number"
+LIST = "a list"
+TEXT = "a string"
+
+
+class InnerShapeError(Exception):
+    """A value from inside the sandbox is not the shape the probe asked for.
+
+    Raised rather than absorbed, so a caller cannot turn the wrong shape
+    into an empty measurement by accident. run_all records anything a probe
+    raises as an error with the positive control failed, which is the
+    correct reading of a target that answered a question nobody asked.
+    """
 
 
 def safe_text(value: object, limit: int = TEXT_LIMIT) -> str:
@@ -75,14 +104,64 @@ def safe_text(value: object, limit: int = TEXT_LIMIT) -> str:
 def bounded(value: object, limit: int = LIST_LIMIT) -> tuple[list[str], int]:
     """Report-safe elements of a target-supplied list, and how many were cut.
 
-    Returns (shown, dropped). A value that is not a list at all yields no
-    elements: the payload's contract is a list, and a caller must not be
-    handed the characters of a string as though they were entries.
+    Returns (shown, dropped). A value that is not a list at all raises
+    InnerShapeError rather than returning an empty result: the payload's
+    contract is a list, a caller must not be handed the characters of a
+    string as though they were entries, and returning ([], 0) for the wrong
+    shape would report that nothing was dropped when everything was. That
+    is the one case this module's own contract forbids, and it is what made
+    a string arriving here read as a measurement that came back empty.
     """
     if not isinstance(value, list):
-        return [], 0
+        raise InnerShapeError(
+            f"the payload sent {type(value).__name__} where {LIST} was expected"
+        )
     shown = [safe_text(item) for item in value[:limit]]
     return shown, max(len(value) - limit, 0)
+
+
+def _has_shape(shape: str, value: object) -> bool:
+    if shape == BOOL:
+        return isinstance(value, bool)
+    if shape == COUNT:
+        # bool subclasses int in Python, so True must not stand in for one
+        # readable process environment.
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    if shape == LIST:
+        return isinstance(value, list)
+    if shape == TEXT:
+        return isinstance(value, str)
+    raise ValueError(f"no such declared shape: {shape!r}")
+
+
+def shape_problem_detail(inner: dict, expected: dict[str, str]) -> str | None:
+    """One error detail naming every way a result missed its shape, or None.
+
+    `expected` maps each key the probe asked the payload for to the shape
+    the answer has to arrive in. A key that is absent, null, or the wrong
+    type is named; nothing else about the value is, because the value came
+    from the system under test and naming its type is enough to say the
+    answer was to a different question.
+
+    Sorted by key, so an error is byte-identical between runs the way a
+    finding is.
+    """
+    problems = []
+    for key in sorted(expected):
+        shape = expected[key]
+        if key not in inner:
+            problems.append(f"{key} is missing")
+        elif not _has_shape(shape, inner[key]):
+            problems.append(
+                f"{key} is {type(inner[key]).__name__} where {shape} was expected"
+            )
+    if not problems:
+        return None
+    return (
+        "the payload result is not the shape this probe asked for, and a key that "
+        "came back missing or wrong-typed cannot be told apart from a measurement "
+        f"that came back negative: {', '.join(problems)}"
+    )
 
 
 def overflow_finding(

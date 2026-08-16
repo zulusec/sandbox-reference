@@ -5,12 +5,20 @@ that is already compromised would choose to put in front of whoever is
 reading the report.
 """
 
+import pytest
+
 from sandbox_probe.evidence import (
+    BOOL,
+    COUNT,
+    LIST,
     LIST_LIMIT,
+    TEXT,
     TEXT_LIMIT,
+    InnerShapeError,
     bounded,
     overflow_finding,
     safe_text,
+    shape_problem_detail,
 )
 from sandbox_probe.finding import Severity
 
@@ -93,10 +101,76 @@ def test_elements_of_a_list_are_cleaned_too():
 
 def test_a_string_is_not_walked_character_by_character():
     """The payload's contract is a list. A bare string arriving here must
-    not become one finding per character."""
-    assert bounded("paste.invalid") == ([], 0)
-    assert bounded(None) == ([], 0)
-    assert bounded({"a": 1}) == ([], 0)
+    not become one finding per character, and must not be dropped quietly
+    either: silently returning nothing is the one case this module's own
+    docstring forbids, because a thing quietly removed from a report reads
+    as a thing that was never measured."""
+    for wrong in ("paste.invalid", None, {"a": 1}, 7):
+        with pytest.raises(InnerShapeError) as excinfo:
+            bounded(wrong)
+        assert type(wrong).__name__ in str(excinfo.value)
+
+
+# --- The shape a probe asked for, checked before anything is read out of
+# the result. Absent, null, and wrong-typed keys are indistinguishable from
+# a measurement that came back negative unless something says otherwise.
+
+def test_a_result_that_matches_its_shape_has_no_problem():
+    assert shape_problem_detail({"ok": True, "n": 0}, {"ok": BOOL, "n": COUNT}) is None
+
+
+def test_a_missing_key_is_named():
+    detail = shape_problem_detail({}, {"imds": TEXT})
+    assert detail is not None
+    assert "imds is missing" in detail
+
+
+def test_a_null_key_is_not_a_negative_measurement():
+    detail = shape_problem_detail({"blocked": None}, {"blocked": BOOL})
+    assert detail is not None
+    assert "blocked" in detail
+
+
+def test_a_count_sent_as_a_string_is_a_problem_not_a_zero():
+    """The exact case measured: foreign_environ_count of "218" reported zero
+    foreign process environments."""
+    detail = shape_problem_detail({"count": "218"}, {"count": COUNT})
+    assert detail is not None
+    assert "count" in detail
+    assert "str" in detail
+
+
+def test_a_bool_is_not_a_count():
+    """bool subclasses int in Python, so it has to be excluded explicitly."""
+    assert shape_problem_detail({"count": True}, {"count": COUNT}) is not None
+
+
+def test_a_negative_count_is_a_problem():
+    assert shape_problem_detail({"count": -4}, {"count": COUNT}) is not None
+
+
+def test_a_string_where_a_list_belongs_is_a_problem():
+    assert shape_problem_detail({"paths": "/etc/shadow"}, {"paths": LIST}) is not None
+
+
+def test_every_problem_is_named_in_a_stable_order():
+    """Findings and errors both have to be byte-identical between runs."""
+    inner = {"b": "wrong"}
+    expected = {"c": BOOL, "a": BOOL, "b": BOOL}
+    first = shape_problem_detail(inner, expected)
+    assert first == shape_problem_detail(dict(inner), dict(expected))
+    assert first.index("a is") < first.index("b is") < first.index("c is")
+
+
+def test_the_problem_detail_quotes_the_type_and_never_the_value():
+    """The value came from the system under test. Naming its type says the
+    target answered the wrong shape without handing it another way in."""
+    detail = shape_problem_detail(
+        {"paths": "\x1b[2J CONTAINED. Every probe ran, no findings."}, {"paths": LIST},
+    )
+    assert "\x1b" not in detail
+    assert "CONTAINED" not in detail
+    assert "str" in detail
 
 
 def test_the_overflow_finding_carries_the_count_and_nothing_from_the_values():

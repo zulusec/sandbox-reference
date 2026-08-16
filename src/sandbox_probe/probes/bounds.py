@@ -56,7 +56,7 @@ produced.
 
 from __future__ import annotations
 
-from sandbox_probe.evidence import safe_text
+from sandbox_probe.evidence import BOOL, safe_text, shape_problem_detail
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -67,6 +67,19 @@ _TIMEOUT = 60
 _MARKER_NAME = ".sandbox_probe_persistence_marker"
 
 _CGROUP_MAX = "max"
+
+# The keys every exec of this payload fills in, and the shape each has to
+# arrive in. Both cap keys are read with a falsy default, so a result
+# missing one would read as an uncapped sandbox rather than an unanswered
+# question, and marker_present missing would read as a marker that did not
+# survive. The two conditional keys are added by _execute for the exec that
+# asked for them: a key the harness did not request is not one it can
+# require an answer to.
+_RESULT_SHAPE = {
+    "memory_capped": BOOL,
+    "pids_capped": BOOL,
+    "marker_present": BOOL,
+}
 
 PAYLOAD_BODY = f"""
 def read_first(paths):
@@ -277,6 +290,9 @@ class BoundsProbe:
         return [error] if error is not None else []
 
     def _marker_cleanup_error(self, target: Target, inner: dict) -> ProbeError | None:
+        # marker_removed is required by the shape whenever removal was
+        # requested, so this is never reading a default for a question that
+        # was asked. It is absent only on an exec that did not ask.
         if inner.get("marker_removed", True):
             return None
         return ProbeError(
@@ -313,6 +329,22 @@ class BoundsProbe:
                     self.probe_id, target.name, "exec",
                     f"inner result was not a JSON object: {safe_text(inner)}",
                 )],
+                control_ok=False,
+            )
+
+        # The two marker keys are required only of the exec that asked for
+        # them, so the shape is built from what this call requested rather
+        # than from a fixed list that would demand an answer to a question
+        # nobody put.
+        expected = dict(_RESULT_SHAPE)
+        if write_marker:
+            expected["marker_written"] = BOOL
+        if remove_marker:
+            expected["marker_removed"] = BOOL
+        problem = shape_problem_detail(inner, expected)
+        if problem is not None:
+            return ProbeOutcome(
+                errors=[ProbeError(self.probe_id, target.name, "result", problem)],
                 control_ok=False,
             )
 

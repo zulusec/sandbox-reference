@@ -158,3 +158,44 @@ def test_credential_paths_are_reported_in_the_harnesss_own_order():
     reported = [f.evidence.split()[0] for f in outcome.findings
                 if f.rule_key == "credential_file"]
     assert reported == list(_CREDENTIAL_PATHS)
+
+
+# --- The result's shape is checked before anything is read out of it. Once
+# parse_inner succeeds, every measurement below is an inner.get with a falsy
+# default, so a key that never came back reads exactly like a key that came
+# back negative. Only a check of the shape tells them apart.
+
+def test_an_empty_result_is_an_error_not_a_clean_verdict():
+    """`{}` used to produce zero findings, zero errors, and a passing
+    control: a clean credentials verdict from a payload that measured
+    nothing at all."""
+    outcome = CredentialsProbe().run(_target({}))
+    assert outcome.findings == []
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "env_secrets is missing" in outcome.errors[0].detail
+
+
+def test_a_missing_imds_key_does_not_default_to_the_good_outcome():
+    inner = {"env_secrets": [], "readable_paths": []}
+    outcome = CredentialsProbe().run(_target(inner))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "imds is missing" in outcome.errors[0].detail
+
+
+def test_an_imds_state_this_probe_does_not_define_is_an_error():
+    """A misspelling, a wrong case, or an invented fourth state used to fall
+    through both branches and report nothing."""
+    for bogus in ("TOKEN_OBTAINED", "reachable", ""):
+        outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds=bogus)))
+        assert outcome.errors, bogus
+        assert outcome.control_ok is False, bogus
+        assert outcome.findings == [], bogus
+
+
+def test_a_wrong_typed_secret_list_is_an_error_not_an_absence():
+    outcome = CredentialsProbe().run(_target(dict(_CLEAN, env_secrets="AWS_SECRET")))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert outcome.findings == []

@@ -227,3 +227,33 @@ def test_a_marker_left_by_an_earlier_run_is_not_attributed_to_this_one():
     outcome = BoundsProbe().run(_target([first, second]))
     assert outcome.control_ok is False
     assert any("earlier run" in error.detail for error in outcome.errors)
+
+
+# --- The result's shape is checked before anything is read out of it. Every
+# measurement is an inner.get with a falsy default, so a key that never came
+# back reads exactly like a cgroup with no ceiling configured, or like a
+# marker that did not survive.
+
+def test_an_empty_result_is_an_error_not_a_clean_verdict():
+    outcome = BoundsProbe().run(_target([{}, {}]))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "memory_capped is missing" in outcome.errors[0].detail
+
+
+def test_a_missing_marker_written_key_is_an_error():
+    """The key the harness asked for by setting PROBE_WRITE_MARKER. Without
+    it there is no answer about whether the write happened, which is not the
+    same as an answer of no."""
+    inner = dict(_BOUNDED)
+    del inner["marker_written"]
+    outcome = BoundsProbe().run(_target([inner, _BOUNDED]))
+    assert outcome.errors
+    assert outcome.control_ok is False
+
+
+def test_a_wrong_typed_cap_is_an_error_not_an_uncapped_sandbox():
+    outcome = BoundsProbe().run(_target([dict(_BOUNDED, memory_capped="yes"), _BOUNDED]))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "memory_uncapped" not in _keys(outcome)
