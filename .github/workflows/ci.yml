@@ -26,12 +26,21 @@ jobs:
       # The end-to-end tests skip themselves when Docker is absent, and a
       # skipped test is a green check that proves nothing. GitHub runners
       # ship Docker, so if this step fails the job fails here rather than
-      # passing with the containment claim quietly unchecked. `-ra` in the
-      # pytest step below reports any skip that happens anyway.
+      # passing with the containment claim quietly unchecked.
       - name: Docker must be available, or the containment claim goes unchecked
         run: |
           docker version
           docker compose version
 
       - run: ruff check .
+
+      # SANDBOX_PROBE_REQUIRE_DOCKER=1 turns every route by which an
+      # end-to-end test could decline to run into a failure rather than a
+      # skip: the module's own guard raises instead of skipping, and a
+      # session hook fails the run if one is skipped from anywhere else.
+      # The step above only proves the daemon answered; this proves the
+      # containment assertions actually executed. `-ra` keeps any skip
+      # visible in the log as well.
       - run: pytest -v -ra
+        env:
+          SANDBOX_PROBE_REQUIRE_DOCKER: "1"

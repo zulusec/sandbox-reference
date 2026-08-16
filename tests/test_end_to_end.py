@@ -22,11 +22,15 @@ import shutil
 import subprocess
 
 import pytest
-from conftest import PROBE_IDS, REPO_ROOT, run_probe
+from conftest import PROBE_IDS, REPO_ROOT, require_docker, run_probe
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("docker") is None, reason="docker is required for the end-to-end tests"
-)
+# Skip locally when Docker is absent, and never skip in CI. Every reason this
+# module might decline to run goes through require_docker, so adding a second
+# condition later cannot quietly reintroduce a green check over an unverified
+# containment claim. conftest's session hook is the backstop for a skip raised
+# from anywhere else, including inside a test body.
+if shutil.which("docker") is None:
+    require_docker("docker is not installed")
 
 _REFERENCE = "reference/docker-compose.yml"
 _LEAKY = "fixtures/leaky/docker-compose.yml"
@@ -163,13 +167,15 @@ def test_findings_surface_is_identical_across_two_separate_invocations(
 
     Only the findings block is compared. Run metadata legitimately varies
     between runs and is excluded by the project's determinism contract.
+
+    No sort_keys on the re-serialization. json.loads preserves the order the
+    keys arrived in, so comparing without normalizing means a between-process
+    difference in key ordering fails here rather than being smoothed away.
     """
     _, first = leaky_run
     _, second = leaky_second_run
     assert first["findings"]
-    assert json.dumps(first["findings"], sort_keys=True) == json.dumps(
-        second["findings"], sort_keys=True
-    )
+    assert json.dumps(first["findings"]) == json.dumps(second["findings"])
 
 
 def test_leaky_sandbox_fails_and_the_run_is_still_complete_enough_to_report(leaky_run):

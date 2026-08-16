@@ -10,10 +10,16 @@ import json
 
 from conftest import PROBE_IDS, run_probe
 
-# Importing the CLI is what registers the probes. Registration happens on
-# module import and nothing else in the package imports the probe modules,
-# so without the cli import here the registry is empty and the ordering
-# assertion below would pass vacuously as [] == [] == [].
+# Importing the CLI is what registers the probes: registration happens on
+# module import and nothing else in the package imports the probe modules.
+# This import is what makes test_probe_registration_order_is_stable below
+# meaningful when this module is run on its own. It does NOT carry that
+# guarantee during a full-suite run, because sibling test modules import all
+# six probe modules at collection time and the registry is already populated
+# by the time anything here executes. The check that holds in every case,
+# including a future one where this import is deleted, is
+# test_list_probes_names_every_registered_probe, which asks a separate
+# process what it registered.
 from sandbox_probe import (
     cli,  # noqa: F401  (imported for registration)
     render,
