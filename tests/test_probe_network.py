@@ -1,7 +1,9 @@
 import json
+import socket
+import threading
 
 from sandbox_probe.inner import MARKER
-from sandbox_probe.probes.network import NetworkProbe
+from sandbox_probe.probes.network import PAYLOAD_BODY, NetworkProbe
 from sandbox_probe.target import ExecResult, Target
 
 
@@ -83,6 +85,44 @@ def test_unparseable_inner_output_is_an_error_not_a_pass():
     assert not outcome.control_ok
 
 
+def test_exec_failure_detail_includes_returncode_and_stderr():
+    """A dead container and a timeout must not both read as the same mystery.
+
+    Finding 4: previously every unparseable-output cause collapsed into
+    'inner payload produced no marked result line', discarding the
+    returncode and stderr Target.run_inside already captured for exactly
+    this situation (see target.py's timeout and exec-failure branches).
+    """
+    target = _target({})
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(124, "", "timed out after 60s"),
+    )
+    outcome = NetworkProbe().run(target)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "124" in detail
+    assert "timed out after 60s" in detail
+
+
+def test_non_dict_inner_result_is_an_error_not_a_crash():
+    """Finding 5: parse_inner returns whatever json.loads produced.
+
+    A marked line carrying a JSON scalar must not raise AttributeError out
+    of run(); it must become a ProbeError like any other protocol failure.
+    """
+    target = _target({})
+    payload = f"{MARKER} 42\n"
+    object.__setattr__(
+        target, "run_inside",
+        lambda argv, timeout: ExecResult(0, payload, ""),
+    )
+    outcome = NetworkProbe().run(target)
+    assert outcome.errors
+    assert not outcome.control_ok
+    assert outcome.findings == []
+
+
 # --- Amendment: the positive control is proxy-aware, not direct-reachability-only.
 #
 # In a correctly contained sandbox (like the reference target) nothing is
@@ -100,7 +140,7 @@ def test_proxy_configured_and_control_satisfied():
     }, proxy="broker:3128", sent=sent))
     assert outcome.control_ok
     payload = sent[0][0]
-    assert "PROBE_PROXY', 'broker:3128'" in payload
+    assert "PROBE_PROXY'] = 'broker:3128'" in payload
 
 
 def test_proxy_configured_and_proxy_unreachable():
@@ -111,7 +151,7 @@ def test_proxy_configured_and_proxy_unreachable():
     }, proxy="broker:3128", sent=sent))
     assert not outcome.control_ok
     payload = sent[0][0]
-    assert "PROBE_PROXY', 'broker:3128'" in payload
+    assert "PROBE_PROXY'] = 'broker:3128'" in payload
 
 
 def test_no_proxy_target_falls_back_to_direct_reachability():
@@ -125,4 +165,112 @@ def test_no_proxy_target_falls_back_to_direct_reachability():
     # No proxy configured: the env var must not carry the string "None",
     # which would be truthy inside the sandbox and wrongly select the
     # proxy branch of the inner control logic.
-    assert "PROBE_PROXY', ''" in payload
+    assert "PROBE_PROXY'] = ''" in payload
+
+
+def test_probe_env_vars_use_direct_assignment_not_setdefault():
+    """Finding 3: the sandbox's own environment must never choose what is measured.
+
+    A preset PROBE_PROXY is the worst case: it would flip a no-proxy target
+    onto the (trivially satisfiable) proxy control branch. setdefault lets
+    that happen; direct assignment does not.
+    """
+    sent: list = []
+    NetworkProbe().run(_target({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": [], "control_reachable": True,
+    }, proxy="broker:3128", sent=sent))
+    payload = sent[0][0]
+    assert "setdefault" not in payload
+    for var in ("PROBE_BLOCKED_HOST", "PROBE_ALLOWED_HOST", "PROBE_C2_HOSTS", "PROBE_PROXY"):
+        assert f"os.environ['{var}'] = " in payload
+
+
+# --- Finding 1 and Finding 2: the inner proxy control logic itself.
+#
+# PAYLOAD_BODY is a module-level string by design, so its function
+# definitions (everything above the environment-variable reads at the
+# bottom) can be exec'd directly and exercised against a real loopback
+# socket, stdlib only, no sandbox and no Docker required. This is the only
+# way to prove proxy_allows and parse_proxy actually do what the amendment
+# requires, rather than just checking that the right strings landed in an
+# env var.
+
+def _load_payload_functions():
+    prefix, marker, _ = PAYLOAD_BODY.partition("\nblocked = os.environ")
+    assert marker, "PAYLOAD_BODY layout changed; update the split point in this test"
+    namespace: dict = {"socket": socket}
+    exec(prefix, namespace)  # noqa: S102 -- exercising the payload's own source
+    return namespace
+
+
+def _serve_once(response: bytes):
+    """Bind a loopback listener that replies once with `response`.
+
+    Returns (port, received) where received[0] is filled in with whatever
+    bytes the client sent, once the exchange completes.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    received: list[bytes] = []
+
+    def _accept():
+        conn, _ = server.accept()
+        with conn:
+            conn.settimeout(3)
+            try:
+                received.append(conn.recv(4096))
+            except OSError:
+                received.append(b"")
+            conn.sendall(response)
+        server.close()
+
+    thread = threading.Thread(target=_accept, daemon=True)
+    thread.start()
+    return port, received, thread
+
+
+def test_proxy_allows_accepts_a_502_and_sends_absolute_uri_form():
+    functions = _load_payload_functions()
+    port, received, thread = _serve_once(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+    result = functions["proxy_allows"](f"127.0.0.1:{port}", "allowed.invalid")
+    thread.join(timeout=3)
+    assert result is True
+    # Pins the absolute-URI requirement: origin form ('GET / HTTP/1.0' with a
+    # Host header) is the exact regression the amendment bans, because it
+    # makes the reference broker log the path as the hostname.
+    assert received[0].startswith(b"GET http://allowed.invalid/ HTTP/1.0")
+
+
+def test_proxy_allows_rejects_a_403():
+    functions = _load_payload_functions()
+    port, _received, thread = _serve_once(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    result = functions["proxy_allows"](f"127.0.0.1:{port}", "blocked.invalid")
+    thread.join(timeout=3)
+    assert result is False
+
+
+def test_proxy_allows_fails_closed_on_an_unreachable_port():
+    functions = _load_payload_functions()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()  # nothing listens here now: the connection is refused
+    assert functions["proxy_allows"](f"127.0.0.1:{port}", "allowed.invalid") is False
+
+
+def test_proxy_allows_fails_closed_on_a_malformed_proxy_value():
+    """Reproduces the reviewer's finding exactly: a config typo must fail
+    closed inside proxy_allows, not raise past it and discard every other
+    measurement this payload took."""
+    functions = _load_payload_functions()
+    assert functions["proxy_allows"]("broker:abc", "allowed.invalid") is False
+    assert functions["proxy_allows"]("broker", "allowed.invalid") is False
+
+
+def test_parse_proxy_strips_ipv6_brackets_like_the_broker_does():
+    functions = _load_payload_functions()
+    assert functions["parse_proxy"]("[::1]:3128") == ("::1", 3128)
+    assert functions["parse_proxy"]("broker:3128") == ("broker", 3128)

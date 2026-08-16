@@ -30,7 +30,7 @@ from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
 from sandbox_probe.result import ProbeError, ProbeOutcome
-from sandbox_probe.target import Target
+from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
 
@@ -49,6 +49,21 @@ def resolves(host):
     except OSError:
         return False
 
+def parse_proxy(value):
+    # 'host:port', or '[ipv6]:port' the way the reference broker's own
+    # host_of parses IPv6 literals. No default port: a proxy value is
+    # always 'host:port' by contract, and guessing a port for a malformed
+    # value would silently connect to the wrong service instead of failing
+    # closed for a reason the target config can be fixed to address.
+    if value.startswith('['):
+        host, _, rest = value[1:].partition(']')
+        port_text = rest[1:] if rest.startswith(':') else ''
+    else:
+        host, sep, port_text = value.rpartition(':')
+        if not sep:
+            host, port_text = value, ''
+    return host, int(port_text)
+
 def proxy_allows(proxy, allowed_host, timeout=3):
     # Open the proxy and ask for allowed_host in absolute-URI form, the way
     # a proxied client would: 'GET http://allowed_host/ HTTP/1.0'. Origin
@@ -61,10 +76,14 @@ def proxy_allows(proxy, allowed_host, timeout=3):
     # allowed one, so 502 counts as success. It proves the broker is up,
     # reachable, and applying its allowlist, which is what the control
     # needs to establish.
-    proxy_host, _, proxy_port = proxy.partition(':')
-    port = int(proxy_port) if proxy_port else 80
+    #
+    # Everything that can go wrong, an unparseable proxy value, a refused
+    # or timed-out connection, a garbled response, is caught here and
+    # fails closed rather than raising past the caller and losing the
+    # rest of this payload's measurements.
     try:
-        with socket.create_connection((proxy_host, port), timeout=timeout) as sock:
+        proxy_host, proxy_port = parse_proxy(proxy)
+        with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock:
             sock.sendall(('GET http://' + allowed_host + '/ HTTP/1.0\\r\\n\\r\\n').encode())
             sock.settimeout(timeout)
             response = b''
@@ -94,15 +113,35 @@ result['control_reachable'] = (
 """
 
 
+def _exec_failure_detail(base: str, executed: ExecResult) -> str:
+    """Fold the exec result's returncode and stderr into an error detail.
+
+    Without this, a dead container, a timeout, and a genuine protocol
+    violation all collapse into the same message, "inner payload produced
+    no marked result line", and an operator cannot tell a target-side
+    problem from a probe-side one.
+    """
+    detail = base
+    if executed.returncode != 0:
+        detail += f" (exit code {executed.returncode})"
+    if executed.stderr.strip():
+        detail += f"; stderr: {executed.stderr.strip()}"
+    return detail
+
+
 class NetworkProbe:
     probe_id = "network"
 
     def run(self, target: Target) -> ProbeOutcome:
+        # Direct assignment, not setdefault: the environment inside the sandbox
+        # belongs to the system under test, and a preset PROBE_* name there
+        # must never be allowed to choose what this probe measures instead of
+        # what the target actually specifies.
         payload = emit(
-            f"os.environ.setdefault('PROBE_BLOCKED_HOST', {target.blocked_host!r})\n"
-            f"os.environ.setdefault('PROBE_ALLOWED_HOST', {target.allowed_host!r})\n"
-            f"os.environ.setdefault('PROBE_C2_HOSTS', {','.join(target.c2_hosts)!r})\n"
-            f"os.environ.setdefault('PROBE_PROXY', {(target.proxy or '')!r})\n"
+            f"os.environ['PROBE_BLOCKED_HOST'] = {target.blocked_host!r}\n"
+            f"os.environ['PROBE_ALLOWED_HOST'] = {target.allowed_host!r}\n"
+            f"os.environ['PROBE_C2_HOSTS'] = {','.join(target.c2_hosts)!r}\n"
+            f"os.environ['PROBE_PROXY'] = {(target.proxy or '')!r}\n"
             + PAYLOAD_BODY
         )
         executed = target.run_inside([payload], timeout=_TIMEOUT)
@@ -110,7 +149,19 @@ class NetworkProbe:
             inner = parse_inner(executed.stdout)
         except InnerProtocolError as error:
             return ProbeOutcome(
-                errors=[ProbeError(self.probe_id, target.name, "exec", str(error))],
+                errors=[ProbeError(
+                    self.probe_id, target.name, "exec",
+                    _exec_failure_detail(str(error), executed),
+                )],
+                control_ok=False,
+            )
+
+        if not isinstance(inner, dict):
+            return ProbeOutcome(
+                errors=[ProbeError(
+                    self.probe_id, target.name, "exec",
+                    f"inner result was not a JSON object: {inner!r}",
+                )],
                 control_ok=False,
             )
 
