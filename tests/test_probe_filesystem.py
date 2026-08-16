@@ -35,7 +35,7 @@ _CLEAN = {
     "writable_outside": [],
     "cleanup_failed_outside": [],
     "foreign_environ_count": 0,
-    "foreign_environ_pids": [],
+    "foreign_environ_uids": [],
     "runtime_sockets": [],
     "workspace_writable": True,
     "workspace_cleanup_failed": False,
@@ -93,46 +93,81 @@ def test_each_outside_workspace_signal_is_reported_separately():
 
 def test_proc_environ_is_a_finding():
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=3, foreign_environ_pids=[1, 214, 907])))
+        _CLEAN, foreign_environ_count=3, foreign_environ_uids=[0, 100])))
     assert "proc_environ" in _keys(outcome)
     finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
-    assert finding.severity.value == "MEDIUM"
     assert "3 process environments" in finding.evidence
-    for pid in ("1", "214", "907"):
-        assert pid in finding.evidence
+    assert "2 distinct owning uids (0, 100)" in finding.evidence
 
 
-def test_proc_environ_evidence_names_the_overflow_rather_than_dumping_it():
-    """A privileged host-PID-namespace container can read hundreds. The
-    finding says how many and shows a bounded sample."""
+def test_proc_environ_is_high():
+    """Raised from MEDIUM once the check became a scan. MEDIUM was calibrated
+    for reading one process's environment. Reading arbitrary foreign process
+    environments is credential exposure, which the credentials probe already
+    rates HIGH for the sandbox's own environment, and this reaches further."""
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=217, foreign_environ_pids=[1, 2, 3])))
+        _CLEAN, foreign_environ_count=218, foreign_environ_uids=[0])))
     finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
-    assert "217 process environments" in finding.evidence
-    assert "and 214 more" in finding.evidence
+    assert finding.severity.value == "HIGH"
+
+
+def test_proc_environ_severity_does_not_scale_with_the_count():
+    """One severity per rule key, as everywhere else in this codebase. The
+    count is in the evidence, not in the grading."""
+    severities = set()
+    for count in (1, 3, 218):
+        outcome = FilesystemProbe().run(_target(dict(
+            _CLEAN, foreign_environ_count=count, foreign_environ_uids=[0])))
+        finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
+        severities.add(finding.severity.value)
+    assert severities == {"HIGH"}
+
+
+def test_proc_environ_evidence_names_no_pid():
+    """A pid is a generated identifier: gone by the time anyone reads the
+    report, and nothing a reader can act on. The count and the owning uids
+    describe the exposure and are stable for a given target state."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, foreign_environ_count=218, foreign_environ_uids=[0, 1, 100])))
+    finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
+    assert "pid" not in finding.evidence.replace("No pid,", "")
+    assert "218 process environments" in finding.evidence
+    assert "3 distinct owning uids (0, 1, 100)" in finding.evidence
 
 
 def test_proc_environ_evidence_carries_no_environment_contents():
-    """This probe reports that a foreign environment was readable, never
-    what was in it, exactly as the credentials probe names variables
-    without values."""
+    """This probe reports that a foreign environment was readable, never what
+    was in it or whose program it was, exactly as the credentials probe names
+    variables without values."""
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=1, foreign_environ_pids=[1])))
+        _CLEAN, foreign_environ_count=1, foreign_environ_uids=[0])))
     finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
-    assert "not reproduced" in finding.evidence
+    assert "No pid, environment content, or command line is reproduced" in finding.evidence
     assert "=" not in finding.evidence
 
 
 def test_proc_environ_singular_reads_naturally():
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=1, foreign_environ_pids=[9])))
+        _CLEAN, foreign_environ_count=1, foreign_environ_uids=[42])))
     finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
     assert "1 process environment owned" in finding.evidence
+    assert "1 distinct owning uid (42)" in finding.evidence
+
+
+def test_proc_environ_bounds_the_uid_list_a_hostile_target_can_supply():
+    """inner comes from the system under test, so a target cannot be allowed
+    to write an unbounded string into this harness's report."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, foreign_environ_count=500, foreign_environ_uids=list(range(40)))))
+    finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
+    assert "40 distinct owning uids" in finding.evidence
+    assert "and 24 more" in finding.evidence
+    assert "39" not in finding.evidence
 
 
 def test_proc_environ_count_of_zero_is_not_a_finding():
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=0, foreign_environ_pids=[])))
+        _CLEAN, foreign_environ_count=0, foreign_environ_uids=[])))
     assert "proc_environ" not in _keys(outcome)
 
 
@@ -141,8 +176,23 @@ def test_proc_environ_ignores_a_non_numeric_count_from_the_target():
     Python, so it is rejected explicitly rather than counting as one."""
     for bogus in (True, "many", None, -4, [1, 2]):
         outcome = FilesystemProbe().run(_target(dict(
-            _CLEAN, foreign_environ_count=bogus, foreign_environ_pids=[1])))
+            _CLEAN, foreign_environ_count=bogus, foreign_environ_uids=[0])))
         assert "proc_environ" not in _keys(outcome), bogus
+
+
+def test_proc_environ_discards_uids_that_are_not_plain_integers():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, foreign_environ_count=2, foreign_environ_uids=[0, True, "root", -1, 7])))
+    finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
+    assert "2 distinct owning uids (0, 7)" in finding.evidence
+
+
+def test_proc_environ_survives_a_missing_uid_list():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, foreign_environ_count=5, foreign_environ_uids="nonsense")))
+    finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
+    assert "5 process environments" in finding.evidence
+    assert "unrecorded set of owning uids" in finding.evidence
 
 
 def test_runtime_socket_is_high():
@@ -339,7 +389,8 @@ def _scan(entries, own_uid=10001, readable=(), **kwargs):
 
     entries maps a /proc name to the uid owning it. readable names the pids
     whose environ opens; every other open raises, which is what a denied
-    ptrace read looks like from Python.
+    ptrace read looks like from Python. The scan returns a count and the
+    distinct owning uids, never a pid.
     """
     scan = _load_payload_function("foreign_process_environs")
     readable = {str(pid) for pid in readable}
@@ -368,18 +419,28 @@ def test_scan_ignores_processes_the_sandbox_owns():
     visible process runs as the payload's own uid. No read is even attempted,
     because ownership is established before the read rather than inferred
     from it."""
-    (count, sample), opened = _scan({"1": 10001, "35": 10001}, own_uid=10001)
-    assert (count, sample) == (0, [])
+    (count, uids), opened = _scan({"1": 10001, "35": 10001}, own_uid=10001)
+    assert (count, uids) == (0, [])
     opened.assert_not_called()
 
 
 def test_scan_reports_only_the_foreign_processes_it_could_read():
     """A mixed table: some processes the sandbox owns, some it does not, and
-    of the latter only some whose environ actually opens."""
+    of the latter only some whose environ actually opens. Pids 1 and 12 are
+    foreign but denied, so neither they nor their uid appear."""
     entries = {"1": 0, "2": 0, "7": 10001, "9": 33, "12": 0}
-    (count, sample), _ = _scan(entries, own_uid=10001, readable=[2, 9])
+    (count, uids), _ = _scan(entries, own_uid=10001, readable=[2, 9])
     assert count == 2
-    assert sample == [2, 9]
+    assert uids == [0, 33]
+
+
+def test_scan_returns_owning_uids_and_never_a_pid():
+    """Pids and uids are drawn from disjoint ranges here, so a scan that
+    leaked pids into the returned list would be visible immediately."""
+    entries = {"900": 3, "901": 4, "902": 3}
+    (count, uids), _ = _scan(entries, own_uid=10001, readable=[900, 901, 902])
+    assert count == 3
+    assert uids == [3, 4]
 
 
 def test_scan_finds_nothing_when_every_foreign_read_is_denied():
@@ -387,59 +448,61 @@ def test_scan_finds_nothing_when_every_foreign_read_is_denied():
     visible, none readable, so there is no finding."""
     entries = {str(pid): 0 for pid in range(1, 219)}
     entries["500"] = 10001
-    (count, sample), _ = _scan(entries, own_uid=10001, readable=[])
-    assert (count, sample) == (0, [])
+    (count, uids), _ = _scan(entries, own_uid=10001, readable=[])
+    assert (count, uids) == (0, [])
 
 
-def test_scan_counts_every_readable_process_but_samples_a_bounded_few():
+def test_scan_counts_every_readable_process_and_collapses_owners_to_uids():
     """The privileged --pid=host case. The count has to be the real total or
-    the finding understates the exposure; the sample has to stay bounded or
-    the evidence string becomes a process dump."""
-    entries = {str(pid): 0 for pid in range(1, 218)}
-    (count, sample), _ = _scan(
-        entries, own_uid=10001, readable=range(1, 218), sample_limit=8,
-    )
+    the finding understates the exposure, while the owners collapse to the
+    handful of distinct uids that describe the shape of it."""
+    entries = {str(pid): (pid % 3) for pid in range(1, 218)}
+    (count, uids), _ = _scan(entries, own_uid=10001, readable=range(1, 218))
     assert count == 217
-    assert len(sample) == 8
-    assert sample == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert uids == [0, 1, 2]
 
 
 def test_scan_stops_walking_at_the_scan_limit():
     """A host with thousands of processes must not stall the probe."""
     entries = {str(pid): 0 for pid in range(1, 5001)}
-    (count, _sample), _ = _scan(
+    (count, _uids), _ = _scan(
         entries, own_uid=10001, readable=range(1, 5001), scan_limit=100,
     )
     assert count == 100
 
 
 def test_scan_walks_pids_in_numeric_order_not_string_order():
-    """os.listdir returns /proc entries in arbitrary order, and the scan
-    limit slices the list, so ordering by string would make which processes
-    get scanned depend on how the kernel happened to lay them out."""
-    entries = {"10": 0, "2": 0, "1": 0}
-    (_count, sample), _ = _scan(entries, own_uid=10001, readable=[1, 2, 10])
-    assert sample == [1, 2, 10]
+    """os.listdir returns /proc entries in arbitrary order and the scan limit
+    slices the list, so ordering by string would make which processes get
+    scanned depend on how the kernel happened to lay them out. Under numeric
+    order this scans pids 1 and 2; under string order it would scan 1 and 10
+    and report a different owner set."""
+    entries = {"10": 5, "2": 7, "1": 9}
+    (count, uids), _ = _scan(
+        entries, own_uid=10001, readable=[1, 2, 10], scan_limit=2,
+    )
+    assert count == 2
+    assert uids == [7, 9]
 
 
 def test_scan_skips_a_process_whose_owner_cannot_be_determined():
     """A process that vanishes mid-walk, or whose stat is denied, supports no
     claim about whose it is. It is skipped, never counted, and no read is
     attempted against it."""
-    entries = {"1": 0, "4": 0}
+    entries = {"1": 0, "4": 7}
     scan = _load_payload_function("foreign_process_environs")
 
     def fake_stat(path):
         if path.endswith("/1"):
             raise OSError("no such process")
-        return mock.Mock(st_uid=0)
+        return mock.Mock(st_uid=7)
 
     with mock.patch("os.getuid", return_value=10001), \
          mock.patch("os.listdir", return_value=list(entries)), \
          mock.patch("os.stat", side_effect=fake_stat), \
          mock.patch("builtins.open", mock.mock_open(read_data=b"X=1\x00")) as opened:
-        count, sample = scan()
-    assert (count, sample) == (1, [4])
+        count, uids = scan()
+    assert (count, uids) == (1, [7])
     assert all("/proc/1/" not in call.args[0] for call in opened.call_args_list)
 
 
@@ -450,8 +513,8 @@ def test_scan_ignores_non_numeric_proc_entries():
          mock.patch("os.listdir", return_value=listing), \
          mock.patch("os.stat", return_value=mock.Mock(st_uid=0)), \
          mock.patch("builtins.open", mock.mock_open(read_data=b"X=1\x00")):
-        count, sample = scan()
-    assert (count, sample) == (2, [1, 4])
+        count, uids = scan()
+    assert (count, uids) == (2, [0])
 
 
 def test_scan_reports_nothing_when_proc_cannot_be_listed():
@@ -466,6 +529,6 @@ def test_scan_finds_foreign_processes_that_a_pid_one_only_check_misses():
     payload's own uid, so any check pinned to PID 1 short-circuits and
     reports nothing, while the sandbox can in fact read foreign process
     environments elsewhere in the table."""
-    entries = {"1": 10001, "88": 0, "91": 0}
-    (count, sample), _ = _scan(entries, own_uid=10001, readable=[88, 91])
-    assert (count, sample) == (2, [88, 91])
+    entries = {"1": 10001, "88": 0, "91": 33}
+    (count, uids), _ = _scan(entries, own_uid=10001, readable=[88, 91])
+    assert (count, uids) == (2, [0, 33])

@@ -41,10 +41,17 @@ of an ordinary Linux filesystem):
   loses this invariant is a sandbox sharing the host's PID namespace with
   enough privilege to read across it, and the processes it can read then
   have unpredictable pids. Measured on a privileged --pid=host container,
-  a PID-1-only check reports nothing while 217 foreign process
+  a PID-1-only check reports nothing while 218 foreign process
   environments are in fact readable. So the whole visible process table is
-  scanned, bounded, and the finding reports how many were readable and a
-  sample of which. Never their contents.
+  scanned, bounded, and the finding reports how many environments were
+  readable and the distinct uids owning them.
+
+  It reports no pid, because a pid is a generated identifier that is gone
+  by the time anyone reads the report and tells the reader nothing they
+  can act on, and reports no environment content or command line at all.
+  Rated HIGH: this is arbitrary credential exposure, the same class the
+  credentials probe rates HIGH for the sandbox's own environment, and
+  strictly worse in reach.
 - container runtime sockets: docker.sock, containerd.sock, crio.sock.
 
 /home, /var/lib, and a bare /root listing are deliberately not probed: they
@@ -66,6 +73,11 @@ from sandbox_probe.result import ProbeError, ProbeOutcome
 from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
+
+# How many distinct owning uids the proc_environ evidence will name before it
+# summarizes the rest. inner comes from the system under test, so the bound
+# lives on this side of the boundary.
+_UID_LIMIT = 16
 
 PAYLOAD_BODY = """
 def write_marker(base):
@@ -105,7 +117,7 @@ for path in ('/host', '/hostfs'):
         pass
 result['listed_outside'] = sorted(listed)
 
-def foreign_process_environs(sample_limit=8, scan_limit=2048):
+def foreign_process_environs(scan_limit=2048):
     # The invariant is that the sandbox cannot read the environment of a
     # process it does not own, so this measures exactly that and nothing
     # else: walk the numeric entries under /proc, and for every one whose
@@ -131,17 +143,26 @@ def foreign_process_environs(sample_limit=8, scan_limit=2048):
     # whose it is, so it is skipped rather than counted.
     #
     # scan_limit bounds the walk so a host with thousands of processes
-    # cannot stall the probe. sample_limit bounds what travels back out.
-    # Environment contents never leave the sandbox at all, the same rule
-    # the credentials probe follows for variable values: this reports that
-    # a foreign environment was readable, never what was in it.
+    # cannot stall the probe. Walking in numeric order matters because of
+    # that slice: ordering by string would make which processes get
+    # scanned depend on how the kernel happened to lay out the directory.
+    #
+    # What comes back is a count and the distinct uids owning those
+    # processes. No pid. A pid is a generated identifier: it is gone by
+    # the time anyone reads the report and there is nothing a reader can
+    # do with it. The count and the owning uids describe the shape of the
+    # exposure and are stable for a given target state. Environment
+    # contents and command lines never leave the sandbox at all, the same
+    # rule the credentials probe follows for variable values: this
+    # reports that a foreign environment was readable, never what was in
+    # it or whose program it was.
     own = os.getuid()
     try:
         pids = sorted(int(name) for name in os.listdir('/proc') if name.isdigit())
     except OSError:
         return 0, []
     count = 0
-    sample = []
+    owners = set()
     for pid in pids[:scan_limit]:
         try:
             owner = os.stat('/proc/' + str(pid)).st_uid
@@ -155,13 +176,12 @@ def foreign_process_environs(sample_limit=8, scan_limit=2048):
         except OSError:
             continue
         count += 1
-        if len(sample) < sample_limit:
-            sample.append(pid)
-    return count, sample
+        owners.add(owner)
+    return count, sorted(owners)
 
-foreign_count, foreign_sample = foreign_process_environs()
+foreign_count, foreign_uids = foreign_process_environs()
 result['foreign_environ_count'] = foreign_count
-result['foreign_environ_pids'] = foreign_sample
+result['foreign_environ_uids'] = foreign_uids
 
 sockets = []
 for path in ('/var/run/docker.sock', '/run/docker.sock',
@@ -215,24 +235,47 @@ def _foreign_count(value) -> int:
     return value
 
 
-def _foreign_environ_evidence(count: int, pids: list) -> str:
-    """Name how many foreign environments opened and a sample of which.
+def _foreign_uids(value) -> list:
+    """The distinct owning uids, from a value the system under test supplied.
 
-    Never any part of their contents. The credentials probe names variables
-    without their values for the same reason: a posture tool that copies a
-    secret into its own report has moved it, not found it.
+    Anything that is not a plain non-negative integer is discarded, bools
+    included since they subclass int.
     """
-    shown = ", ".join(str(pid) for pid in pids)
-    if not shown:
-        shown = "not recorded"
-    elif count > len(pids):
-        shown = f"{shown} and {count - len(pids)} more"
+    if not isinstance(value, list):
+        return []
+    return sorted({
+        item for item in value
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+    })
+
+
+def _foreign_environ_evidence(count: int, uids: list) -> str:
+    """Name how many foreign environments opened and which uids own them.
+
+    No pid: a pid is a generated identifier, gone by the time anyone reads
+    the report and carrying nothing a reader can act on. No environment
+    contents and no command line either. The credentials probe names
+    variables without their values for the same reason: a posture tool that
+    copies a secret into its own report has moved it, not found it.
+
+    The uid list is bounded here rather than in the payload because inner
+    comes from the system under test, and a hostile target must not be able
+    to write an unbounded string into this harness's report.
+    """
+    shown = ", ".join(str(uid) for uid in uids[:_UID_LIMIT])
+    if len(uids) > _UID_LIMIT:
+        shown = f"{shown} and {len(uids) - _UID_LIMIT} more"
+    owner_noun = "uid" if len(uids) == 1 else "uids"
+    owners = f"{len(uids)} distinct owning {owner_noun} ({shown})" if uids else (
+        "an unrecorded set of owning uids"
+    )
     noun = "environment" if count == 1 else "environments"
     return (
         f"{count} process {noun} owned by a different user could be opened from "
-        f"inside the sandbox (pids {shown}). Reading a process the sandbox does "
-        "not own needs root or CAP_SYS_PTRACE, and a process environment is "
-        "where credentials sit. The contents are deliberately not reproduced here."
+        f"inside the sandbox, across {owners}. Reading a process the sandbox does "
+        "not own needs root or CAP_SYS_PTRACE, and a process environment is where "
+        "credentials sit. No pid, environment content, or command line is "
+        "reproduced here."
     )
 
 
@@ -300,13 +343,12 @@ class FilesystemProbe:
             ))
         foreign_count = _foreign_count(inner.get("foreign_environ_count"))
         if foreign_count:
-            pids = inner.get("foreign_environ_pids")
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
-                rule_key="proc_environ", severity=Severity.MEDIUM,
-                title="Another process environment is readable",
+                rule_key="proc_environ", severity=Severity.HIGH,
+                title="Process environments the sandbox does not own are readable",
                 evidence=_foreign_environ_evidence(
-                    foreign_count, pids if isinstance(pids, list) else [],
+                    foreign_count, _foreign_uids(inner.get("foreign_environ_uids")),
                 ),
             ))
         for path in inner.get("runtime_sockets", []):
