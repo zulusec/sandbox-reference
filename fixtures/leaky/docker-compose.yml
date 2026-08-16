@@ -1,0 +1,29 @@
+# Deliberately broken. Every setting here is the wrong answer, and each one
+# is what some real deployment ships by default. Never use this as a base.
+services:
+  sandbox:
+    image: python:3.12-alpine
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    volumes:
+      - ./workspace:/workspace:rw
+      - /:/host:ro                              # invariant 3: host filesystem
+      - /var/run/docker.sock:/var/run/docker.sock  # invariant 3: runtime socket
+    environment:
+      AWS_SECRET_ACCESS_KEY: "AKIAIOSFODNN7EXAMPLEKEYNOTREAL"  # invariant 2
+      DATABASE_PASSWORD: "hunter2-not-real"                    # invariant 2
+    # no networks key: default bridge, so egress is unrestricted (invariant 1)
+    # no mem_limit, no pids_limit (invariant 4)
+    # no user, no cap_drop, no read_only (invariants 2 and 3)
+
+  unauthorized:
+    image: python:3.12-alpine
+    command: ["python3", "-m", "http.server", "80"]
+    # Stands in for a real external host the sandbox has no business
+    # reaching. It sits on the same default network as `sandbox`, which has
+    # no boundary at all (invariant 1), so the connection succeeds. This
+    # exists only because a `.invalid` hostname can never resolve for
+    # anyone, including a fully open sandbox; the network probe needs a
+    # host that is genuinely reachable to prove the leak is real, and this
+    # keeps that host offline and dependency-light instead of naming a real
+    # external service. It is not itself part of what is under test.
