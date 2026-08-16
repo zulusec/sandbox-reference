@@ -437,8 +437,11 @@ those probes report a finding rather than a pass. Where the harness supplied a
 value it compares against its own copy rather than the sandbox's echo of it,
 and everything that does come back is stripped of control characters and
 bounded in length and count before it reaches the report, so a hostile target
-cannot forge the report itself. It can still forge the measurement in those
-four probes. This harness answers whether a sandbox is configured to contain,
+cannot forge the report's rendering: it cannot repaint your terminal, flood it,
+or write text of its choosing into a finding. What it can still forge is the
+measurement itself in those four probes, by honestly performing the crossings
+the harness can corroborate and lying about the rest. Sanitizing what a liar
+says is not the same as catching the lie. This harness answers whether a sandbox is configured to contain,
 not whether an already-compromised one is telling the truth.
 
 ## Probing your own sandbox
