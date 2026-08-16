@@ -1,13 +1,20 @@
 import json
 import socket
 import threading
+import time
 
 from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.attribution import PAYLOAD_BODY, AttributionProbe
 from sandbox_probe.target import ExecResult, Target
 
 
-def _target(log_lines, configured=True, proxy="broker:3128", sent=None):
+def _target(log_lines, configured=True, proxy="broker:3128", sent=None, before_lines=None):
+    """`log_lines` are the lines this run's crossings append: the request
+    log's baseline read returns `before_lines` (empty by default, as if
+    nothing had run yet) and its post-crossing read returns
+    `before_lines + log_lines`, matching the append-only shape the real
+    broker produces and exercising the probe's before/after delta rather
+    than a single whole-log read."""
     target = Target(
         name="t", exec_command=["true"],
         allowed_host="allowed.invalid", blocked_host="blocked.invalid",
@@ -22,12 +29,20 @@ def _target(log_lines, configured=True, proxy="broker:3128", sent=None):
         return ExecResult(0, f"{MARKER} {json.dumps(inner)}\n", "")
 
     object.__setattr__(target, "run_inside", run_inside)
-    body = "\n".join(json.dumps(line) for line in log_lines)
-    object.__setattr__(
-        target, "read_request_log",
-        lambda timeout=30: ExecResult(0 if configured else 1, body,
-                                      "" if configured else "not configured"),
-    )
+
+    before = before_lines or []
+    before_body = "\n".join(json.dumps(line) for line in before)
+    after_body = "\n".join(json.dumps(line) for line in before + log_lines)
+    calls = {"n": 0}
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if not configured:
+            return ExecResult(1, "", "not configured")
+        body = before_body if calls["n"] == 1 else after_body
+        return ExecResult(0, body, "")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
     return target
 
 
@@ -80,6 +95,67 @@ def test_read_request_log_failure_is_an_error_not_a_pass():
     assert outcome.errors
     assert not outcome.control_ok
     assert "no such container" in outcome.errors[0].detail
+
+
+# --- The log is append-only across runs; the comparison must not be.
+#
+# requests.log accumulates forever and nothing resets it between runs, so
+# comparing this run's attempted hosts against the whole log is satisfiable
+# by an entry an earlier run left behind. The probe instead reads the log
+# before generating crossings and again after, and compares only the lines
+# appended in between.
+
+def test_a_stale_log_entry_does_not_mask_an_unlogged_crossing():
+    """The defining regression: blocked.invalid is already in the log
+    before this run even starts (left over from an earlier run), and this
+    run's crossing to it is never actually appended. A whole-log comparison
+    would find blocked.invalid present and call the run clean; the delta
+    must not."""
+    outcome = AttributionProbe().run(_target(
+        [_BOTH_LOGGED[0]],  # this run only appends the allowed.invalid entry
+        before_lines=[_BOTH_LOGGED[1]],  # blocked.invalid is already there
+    ))
+    finding = next(f for f in outcome.findings if f.rule_key == "crossing_unlogged")
+    assert "blocked.invalid" in finding.evidence
+
+
+def test_first_read_failure_is_treated_as_an_empty_baseline_not_an_error():
+    """A target's very first run has no requests.log yet. That must read as
+    zero prior lines, not as a probe failure."""
+    target = _target(_BOTH_LOGGED)
+    calls = {"n": 0}
+    after_body = "\n".join(json.dumps(line) for line in _BOTH_LOGGED)
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ExecResult(1, "", "cat: requests.log: No such file or directory")
+        return ExecResult(0, after_body, "")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = AttributionProbe().run(target)
+    assert outcome.findings == []
+    assert outcome.control_ok
+
+
+def test_log_shrinking_between_reads_is_an_error_not_an_empty_delta():
+    """Fewer lines after this run's crossings than before them means
+    rotation or truncation happened mid-run. That is a condition the probe
+    cannot measure through, so it must not read as an empty (clean) delta."""
+    target = _target(_BOTH_LOGGED)
+    calls = {"n": 0}
+    long_body = "\n".join(json.dumps(line) for line in _BOTH_LOGGED * 3)
+    short_body = "\n".join(json.dumps(line) for line in _BOTH_LOGGED)
+
+    def read_request_log(timeout=30):
+        calls["n"] += 1
+        return ExecResult(0, long_body if calls["n"] == 1 else short_body, "")
+
+    object.__setattr__(target, "read_request_log", read_request_log)
+    outcome = AttributionProbe().run(target)
+    assert outcome.errors
+    assert not outcome.control_ok
+    assert outcome.findings == []
 
 
 def test_unparseable_inner_output_is_an_error_not_a_pass():
@@ -161,9 +237,9 @@ def _load_payload_functions():
     return namespace
 
 
-def _serve_once():
-    """Bind a loopback listener that accepts one connection and records what
-    it received, without sending a reply (the payload does not read one)."""
+def _serve_once(response: bytes):
+    """Bind a loopback listener that replies once with `response`, the way
+    _serve_once in test_probe_network.py stands in for the broker."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -178,6 +254,7 @@ def _serve_once():
                 received.append(conn.recv(4096))
             except OSError:
                 received.append(b"")
+            conn.sendall(response)
         server.close()
 
     thread = threading.Thread(target=_accept, daemon=True)
@@ -187,10 +264,41 @@ def _serve_once():
 
 def test_cross_via_proxy_sends_absolute_uri_form():
     functions = _load_payload_functions()
-    port, received, thread = _serve_once()
+    port, received, thread = _serve_once(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
     functions["cross_via_proxy"](f"127.0.0.1:{port}", "allowed.invalid")
     thread.join(timeout=3)
     assert received[0].startswith(b"GET http://allowed.invalid/ HTTP/1.0")
+
+
+def test_cross_via_proxy_waits_for_the_response_before_returning():
+    """Finding 2: under a before/after log delta, the harness's read of the
+    request log after this payload exits must happen after the broker has
+    finished writing its log line, not merely after this socket write
+    landed. cross_via_proxy proves it waited by only returning once a
+    response is readable; a server that delays its response before sending
+    one forces a measurable wait if that reading is real."""
+    functions = _load_payload_functions()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _accept():
+        conn, _ = server.accept()
+        with conn:
+            conn.settimeout(3)
+            conn.recv(4096)
+            time.sleep(0.3)
+            conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        server.close()
+
+    thread = threading.Thread(target=_accept, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    functions["cross_via_proxy"](f"127.0.0.1:{port}", "allowed.invalid")
+    elapsed = time.monotonic() - started
+    thread.join(timeout=3)
+    assert elapsed >= 0.25
 
 
 def test_cross_via_proxy_fails_closed_on_an_unreachable_proxy():

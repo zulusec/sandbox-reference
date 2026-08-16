@@ -9,6 +9,20 @@ reason anyone knows what happened.
 A target with no request log fails here rather than passing quietly.
 Nothing to read is the worst possible result, not the cleanest one.
 
+requests.log is append-only and nothing resets it between runs, so a whole-
+log comparison is satisfiable by a stale entry: a host logged by an earlier
+run stays in the log forever, and a later run whose crossing genuinely
+failed to reach the broker would still find that host present and report
+clean. That is a false clean, the worst failure mode this harness has. So
+the log is read once before the crossings run and once after, and only the
+lines appended in between are compared against this run's attempted hosts.
+The log not existing yet on the first read counts as zero prior lines, not
+an error, since that is the ordinary shape of a target's very first run.
+The second read failing, or coming back with fewer lines than the first
+(rotation, truncation), is a condition this probe cannot measure through,
+so it is surfaced as a ProbeError rather than read as an empty, and
+therefore clean, delta.
+
 The crossings have to actually traverse something that logs them. A raw TCP
 connect to allowed_host or blocked_host never reaches the broker in the
 reference sandbox: there is no route to anything else, the connection
@@ -63,10 +77,25 @@ def cross_via_proxy(proxy, host, timeout=3):
     # attempt still counts as made even when it could not be delivered, and
     # a broker that never saw it is exactly the crossing_unlogged case this
     # probe exists to catch.
+    #
+    # The response is read before returning, the way network.py's
+    # proxy_allows already does. Without this, the harness's read of the
+    # request log after this payload exits is racing the broker's own
+    # write of its log line, with nothing but incidental exec latency
+    # keeping the order right. Reading a full status line back proves the
+    # broker finished handling the request, log line included, before this
+    # function hands control back.
     try:
         proxy_host, proxy_port = parse_proxy(proxy)
         with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as sock:
             sock.sendall(('GET http://' + host + '/ HTTP/1.0\\r\\n\\r\\n').encode())
+            sock.settimeout(timeout)
+            response = b''
+            while b'\\r\\n' not in response:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                response += chunk
     except (OSError, ValueError):
         pass
 
@@ -112,12 +141,16 @@ def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     return detail
 
 
-def _parse_log(text: str) -> list[dict]:
+def _lines(text: str) -> list[str]:
+    """Non-empty, stripped raw lines, kept as text so a line count taken
+    before the crossings run and one taken after can be compared directly,
+    before any line is parsed as JSON."""
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _parse_lines(lines: list[str]) -> list[dict]:
     entries = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for line in lines:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -131,6 +164,30 @@ class AttributionProbe:
     probe_id = "attribution"
 
     def run(self, target: Target) -> ProbeOutcome:
+        if target.request_log_command is None:
+            return ProbeOutcome(
+                findings=[Finding(
+                    probe_id=self.probe_id, subject=target.name,
+                    rule_key="no_request_log", severity=Severity.HIGH,
+                    title="The target has no request log",
+                    evidence=(
+                        "No request log is configured for this target. Boundary "
+                        "crossings cannot be reconstructed afterward, which is "
+                        "the difference between an incident and a mystery."
+                    ),
+                )],
+                control_ok=False,
+            )
+
+        # Baseline read, before this run's crossings exist. A non-zero
+        # returncode here counts as zero prior lines rather than an error:
+        # the ordinary shape of a target's very first run is a request log
+        # that does not exist yet. If the read is broken for a real reason
+        # rather than a missing file, the second read below will fail the
+        # same way and that failure is not forgiven.
+        before = target.read_request_log()
+        before_lines = _lines(before.stdout) if before.returncode == 0 else []
+
         hosts = [target.allowed_host, target.blocked_host]
         # Direct assignment, not setdefault: the environment inside the sandbox
         # belongs to the system under test, and a preset PROBE_* name there
@@ -162,32 +219,38 @@ class AttributionProbe:
                 control_ok=False,
             )
 
-        if target.request_log_command is None:
-            return ProbeOutcome(
-                findings=[Finding(
-                    probe_id=self.probe_id, subject=target.name,
-                    rule_key="no_request_log", severity=Severity.HIGH,
-                    title="The target has no request log",
-                    evidence=(
-                        "No request log is configured for this target. Boundary "
-                        "crossings cannot be reconstructed afterward, which is "
-                        "the difference between an incident and a mystery."
-                    ),
-                )],
-                control_ok=False,
-            )
-
-        read = target.read_request_log()
-        if read.returncode != 0:
+        # Second read, after this run's crossings ran. Its failure is a real
+        # error: the request log was reachable enough for the baseline read
+        # or crossings would not have been worth running, so a failure now
+        # is a target-side problem this probe cannot see past.
+        after = target.read_request_log()
+        if after.returncode != 0:
             return ProbeOutcome(
                 errors=[ProbeError(
                     self.probe_id, target.name, "read_request_log",
-                    _exec_failure_detail("could not read the request log", read),
+                    _exec_failure_detail("could not read the request log", after),
                 )],
                 control_ok=False,
             )
 
-        entries = _parse_log(read.stdout)
+        after_lines = _lines(after.stdout)
+        if len(after_lines) < len(before_lines):
+            return ProbeOutcome(
+                errors=[ProbeError(
+                    self.probe_id, target.name, "read_request_log",
+                    f"the request log had {len(before_lines)} lines before this run's "
+                    f"crossings and only {len(after_lines)} after; it appears to have "
+                    "been rotated or truncated, and this run's crossings cannot be "
+                    "attributed against a log that shrank",
+                )],
+                control_ok=False,
+            )
+
+        # Only the lines this run appended. requests.log is append-only and
+        # nothing resets it between runs, so comparing against the whole log
+        # would let a stale entry from an earlier run mask a crossing that
+        # this run's payload never actually got logged.
+        entries = _parse_lines(after_lines[len(before_lines):])
         logged_hosts = {entry.get("host") for entry in entries}
         attempted = inner.get("attempted", [])
 
