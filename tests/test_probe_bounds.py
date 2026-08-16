@@ -1,7 +1,12 @@
 import json
+import os
+import stat
+import tempfile
+
+import pytest
 
 from sandbox_probe.inner import MARKER
-from sandbox_probe.probes.bounds import BoundsProbe
+from sandbox_probe.probes.bounds import PAYLOAD_BODY, BoundsProbe
 from sandbox_probe.target import ExecResult, Target
 
 
@@ -37,12 +42,20 @@ def _keys(outcome):
 # sandbox. See bounds.py's module docstring for why: cgroups have no
 # wall-clock primitive, and a wall-clock bound is enforced by whatever
 # invokes the task, not by the sandbox itself.
-_BOUNDED = {"memory_capped": True, "pids_capped": True, "marker_present": False}
+#
+# marker_written is what makes the disposability half of this probe a
+# measurement rather than an assumption. The first exec writes the marker and
+# says whether the write succeeded; without that key, a workspace that
+# refused the write is indistinguishable from a sandbox that disposed of it.
+_BOUNDED = {"memory_capped": True, "pids_capped": True, "marker_present": False,
+            "marker_written": True, "marker_removed": True}
 
 
 def test_bounded_and_disposable_sandbox_is_clean():
     outcome = BoundsProbe().run(_target([_BOUNDED, _BOUNDED]))
     assert outcome.findings == []
+    assert outcome.errors == []
+    assert outcome.control_ok is True
 
 
 def test_uncapped_memory_is_a_finding():
@@ -86,3 +99,86 @@ def test_failed_reset_is_an_error():
     outcome = BoundsProbe().run(_target([_BOUNDED, _BOUNDED], reset_ok=False))
     assert outcome.errors
     assert not outcome.control_ok
+
+
+# --- The disposability positive control.
+#
+# The marker write is what this probe's disposability half rests on. If the
+# write did not happen, the reset had nothing to dispose of, and the absence
+# of a surviving marker afterward is not evidence of anything. A control
+# whose value is measured, sent across the boundary, and then discarded is a
+# control that does not control anything.
+
+def _run_payload_marker_block(workspace: str, write: bool = True) -> dict:
+    """Run the payload's own marker code against a real directory.
+
+    The payload is a single source string piped into an interpreter inside
+    the target, so exercising it here means exec'ing it with the same
+    namespace emit() gives it. What comes back is the real result dict,
+    including whether the write actually succeeded.
+    """
+    namespace: dict = {"os": os, "result": {}}
+    previous = os.getcwd()
+    os.chdir(workspace)
+    try:
+        os.environ["PROBE_WRITE_MARKER"] = "1" if write else "0"
+        os.environ["PROBE_REMOVE_MARKER"] = "0"
+        exec(PAYLOAD_BODY, namespace)  # noqa: S102 -- the payload's own source
+    finally:
+        os.chdir(previous)
+        os.environ.pop("PROBE_WRITE_MARKER", None)
+        os.environ.pop("PROBE_REMOVE_MARKER", None)
+    return namespace["result"]
+
+
+def test_a_read_only_workspace_reports_the_marker_write_as_failed():
+    """The payload half: a workspace that refuses the write says so."""
+    with tempfile.TemporaryDirectory() as workspace:
+        os.chmod(workspace, stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            if os.access(workspace, os.W_OK):  # pragma: no cover - root only
+                pytest.skip("this user can write to a read-only directory")
+            result = _run_payload_marker_block(workspace)
+        finally:
+            os.chmod(workspace, stat.S_IRWXU)
+    assert result["marker_written"] is False
+    assert result["marker_present"] is False
+
+
+def test_a_read_only_workspace_fails_the_disposability_control():
+    """The harness half, driven by the result a real read-only workspace
+    produces. No marker was written, so the reset disposed of nothing and
+    this run measured nothing about disposability. It must not read clean."""
+    with tempfile.TemporaryDirectory() as workspace:
+        os.chmod(workspace, stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            if os.access(workspace, os.W_OK):  # pragma: no cover - root only
+                pytest.skip("this user can write to a read-only directory")
+            first = _run_payload_marker_block(workspace)
+        finally:
+            os.chmod(workspace, stat.S_IRWXU)
+
+    outcome = BoundsProbe().run(_target([dict(_BOUNDED, **first), _BOUNDED]))
+
+    assert outcome.control_ok is False
+    assert outcome.errors
+    assert "persists_across_runs" not in _keys(outcome)
+    assert any("marker" in error.detail for error in outcome.errors)
+
+
+def test_a_failed_marker_write_is_never_a_clean_disposability_result():
+    outcome = BoundsProbe().run(_target([dict(_BOUNDED, marker_written=False), _BOUNDED]))
+    assert outcome.control_ok is False
+    assert outcome.errors
+
+
+def test_a_marker_left_by_an_earlier_run_is_not_attributed_to_this_one():
+    """marker_present on the first exec means an earlier run left a marker
+    behind. A marker surviving the reset then proves nothing about this
+    run's write, so the run says so rather than reporting a HIGH finding
+    attributable to nothing."""
+    first = dict(_BOUNDED, marker_present=True)
+    second = dict(_BOUNDED, marker_present=True)
+    outcome = BoundsProbe().run(_target([first, second]))
+    assert outcome.control_ok is False
+    assert any("earlier run" in error.detail for error in outcome.errors)

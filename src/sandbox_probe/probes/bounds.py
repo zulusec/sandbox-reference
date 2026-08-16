@@ -34,6 +34,16 @@ foothold across evaluation runs. A target with no reset path at all reports
 that as its own finding rather than skipping quietly, because a sandbox
 nobody can reset carries state from one task to the next by definition.
 
+That test has two preconditions, and both are read back out of the payload
+rather than assumed. The marker has to have been written, or the reset
+disposed of nothing and the absence of a marker afterward is not evidence:
+a read-only workspace would otherwise read as perfect disposability. And
+the workspace must not already have held a marker before this run wrote
+one, or a marker found afterward belongs to some earlier run and this run
+cannot attribute its survival to its own write. Either way the disposability
+half did not happen, so it is reported as unmeasured, with the positive
+control failed, rather than answered.
+
 The marker this probe writes is always removed before the probe finishes,
 on every path: the compliant path where the reset itself wipes it, the
 leaky path where it survives the reset and must be deleted explicitly, the
@@ -178,6 +188,34 @@ class BoundsProbe:
             return ProbeOutcome(
                 findings=findings,
                 errors=self._cleanup(target),
+                control_ok=False,
+            )
+
+        # Both halves of the disposability precondition, read from the first
+        # exec's own result rather than assumed from the fact that the exec
+        # returned. A write that did not happen and a marker that was
+        # already there both mean the same thing: whatever the reset does
+        # next, this run cannot read the answer as its own measurement.
+        disposability_errors = []
+        if first.get("marker_written") is not True:
+            disposability_errors.append(ProbeError(
+                self.probe_id, target.name, "marker",
+                f"{_MARKER_NAME} could not be written into the workspace, so the "
+                "reset had nothing of this run's to dispose of. Disposability was "
+                "not measured here, and no result about it is reported.",
+            ))
+        if first.get("marker_present"):
+            disposability_errors.append(ProbeError(
+                self.probe_id, target.name, "marker",
+                f"{_MARKER_NAME} was already in the workspace before this run wrote "
+                "one, so it was left by an earlier run. A marker found after the "
+                "reset could not be attributed to this run's write.",
+            ))
+        if disposability_errors:
+            disposability_errors.extend(self._cleanup(target))
+            return ProbeOutcome(
+                findings=findings,
+                errors=disposability_errors,
                 control_ok=False,
             )
 
