@@ -4,9 +4,13 @@ findings_json is the surface the determinism test compares. It excludes run
 metadata on purpose, because metadata legitimately varies between runs while
 findings must not.
 
-The word CONTAINED appears only when every probe ran and found nothing. A
-reader must never be able to mistake an incomplete run for a sandbox that
-held.
+The word CONTAINED appears only when every registered probe ran and found
+nothing. A reader must never be able to mistake an incomplete run, or a run
+that only covered a subset of the registered probes, for a sandbox that
+held. to_table accepts the same metadata dict as to_json so it can tell a
+subset selection from a full one; metadata carrying probes_selected and
+probes_registered that disagree makes CONTAINED unreachable and names the
+subset instead.
 """
 
 from __future__ import annotations
@@ -37,14 +41,42 @@ def to_json(report: RunReport, metadata: dict) -> str:
     return json.dumps(payload, **_JSON_ARGS) + "\n"
 
 
-def to_table(report: RunReport) -> str:
+def to_table(report: RunReport, metadata: dict | None = None) -> str:
+    partial = _partial_selection(metadata)
     blocks = []
+    if partial is not None:
+        blocks.append(_partial_block(*partial))
     if report.errors:
         blocks.append(_incomplete_block(report))
     if report.controls_failed:
         blocks.append(_control_block(report))
-    blocks.append(_findings_block(report))
+    blocks.append(_findings_block(report, is_partial=partial is not None))
     return "\n".join(blocks)
+
+
+def _partial_selection(metadata: dict | None) -> tuple[list[str], list[str]] | None:
+    """None means full coverage (or no selection info at all); otherwise the
+    (selected, registered) probe id lists, for a selection that left probes
+    out."""
+    if not metadata:
+        return None
+    selected = metadata.get("probes_selected")
+    registered = metadata.get("probes_registered")
+    if selected is None or registered is None:
+        return None
+    if set(selected) == set(registered):
+        return None
+    return sorted(selected), sorted(registered)
+
+
+def _partial_block(selected: list[str], registered: list[str]) -> str:
+    names = ", ".join(selected)
+    return "\n".join([
+        f"PARTIAL RUN: {len(selected)} of {len(registered)} probes selected ({names}).",
+        "This is not a full assessment. A pipeline must not read this run's",
+        "exit code as containment.",
+        "",
+    ])
 
 
 def _incomplete_block(report: RunReport) -> str:
@@ -75,9 +107,9 @@ def _control_block(report: RunReport) -> str:
     ])
 
 
-def _findings_block(report: RunReport) -> str:
+def _findings_block(report: RunReport, is_partial: bool = False) -> str:
     if not report.findings:
-        if report.complete:
+        if report.complete and not is_partial:
             return "CONTAINED. Every probe ran, no findings.\n"
         return "No findings in what could be measured.\n"
 

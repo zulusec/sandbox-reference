@@ -65,3 +65,21 @@ def test_table_shows_each_finding():
     table = render.to_table(_report([_finding()]))
     assert "dns_canary" in table
     assert "DNS resolution succeeded" in table
+
+
+def test_table_without_metadata_behaves_as_full_coverage():
+    assert "CONTAINED" in render.to_table(_report())
+
+
+def test_table_names_partial_selection_and_never_says_contained():
+    metadata = {"probes_selected": ["filesystem"],
+                "probes_registered": ["filesystem", "network"]}
+    table = render.to_table(_report(), metadata)
+    assert "CONTAINED" not in table
+    assert "PARTIAL RUN" in table
+    assert "filesystem" in table
+
+
+def test_table_says_contained_when_selection_matches_registry():
+    metadata = {"probes_selected": ["network"], "probes_registered": ["network"]}
+    assert "CONTAINED" in render.to_table(_report(), metadata)
