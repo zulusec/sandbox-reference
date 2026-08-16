@@ -66,29 +66,42 @@ def test_run_inside_reports_timeout_as_a_nonzero_result(tmp_path):
 # --- A reset that returns before the sandbox is usable is not a reset.
 #
 # `docker compose restart` returns in tens of milliseconds on Compose v5 and
-# leaves the service still stopping, so the next probe execs into a container
-# that is about to be killed and gets SIGKILLed partway through its payload.
-# Observed live against the reference stack: two runs in three lost the
-# network probe that way, reporting exit 137, an empty result and a failed
-# positive control. The harness was honest about not having measured, and
-# the reason it had not measured was its own reset.
+# leaves the service still stopping. Stopping the reference sandbox takes a
+# measured 10.1 seconds and ends in SIGKILL, because `sleep infinity` does
+# not die on SIGTERM, so the container spends ten seconds on its way down and
+# answers execs for most of it. Waiting for an exec to succeed, or even for
+# one that lasts a couple of seconds, gets its answer from the container that
+# is about to be killed. The next probe then starts a payload that takes
+# twenty six seconds and the stop lands in the middle of it: exit 137, an
+# empty result, and a positive control that failed on a sandbox that is fine.
+#
+# So readiness asks whether the sandbox is a new one, not whether it answers.
+# The identity is the start time of its init process, which no container on
+# its way down can change and which needs nothing vendor-specific to read.
 
-def _counting_target(tmp_path, failures: int):
-    """A target whose exec fails `failures` times before it succeeds, the
-    way a container that is still restarting does."""
+def _identity_target(tmp_path, values: list[str], failures: int = 0):
+    """A target whose exec reports each of `values` in turn, then repeats the
+    last one, and which refuses the first `failures` calls the way a
+    container that has not come back yet does."""
     counter = tmp_path / "attempts"
     counter.write_text("", encoding="utf-8")
-    script = tmp_path / "flaky-exec.sh"
+    script = tmp_path / "identity-exec.sh"
+    cases = "\n".join(
+        f'  {n}) echo "{value}" ;;' for n, value in enumerate(values, start=failures + 1)
+    )
     script.write_text(
         "#!/bin/sh\n"
         "cat >/dev/null\n"
         f'printf x >> "{counter}"\n'
         f'attempts=$(wc -c < "{counter}")\n'
-        f"if [ \"$attempts\" -le {failures} ]; then\n"
+        f'if [ "$attempts" -le {failures} ]; then\n'
         '  echo "service \\"sandbox\\" is not running" >&2\n'
         "  exit 1\n"
         "fi\n"
-        "echo ready\n",
+        'case "$attempts" in\n'
+        f"{cases}\n"
+        f'  *) echo "{values[-1]}" ;;\n'
+        "esac\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -97,54 +110,80 @@ def _counting_target(tmp_path, failures: int):
     ))), counter
 
 
-def test_reset_waits_until_the_sandbox_can_run_a_command_again(tmp_path):
-    target, counter = _counting_target(tmp_path, failures=3)
+def test_reset_waits_for_the_sandbox_to_become_a_different_one(tmp_path):
+    """The identity read before the reset is the one that has to go away."""
+    target, counter = _identity_target(tmp_path, ["old", "old", "old", "new"])
     result = target.reset(timeout=30)
     assert result.returncode == 0
-    # The reset command itself succeeded immediately; what took the time was
-    # waiting for the sandbox to answer. Four attempts: three refusals and
-    # the one that worked.
+    # One read before the reset, two that still saw the old sandbox, and the
+    # one that saw the new one.
     assert len(counter.read_text(encoding="utf-8")) == 4
-    # And the sandbox really is usable when reset returns, which is the
-    # whole contract.
-    assert target.run_inside(["print('x')"], timeout=10).returncode == 0
+
+
+def test_an_exec_that_answers_is_not_proof_the_sandbox_came_back(tmp_path):
+    """The regression this exists for.
+
+    Every exec here succeeds, immediately, for the whole budget. A readiness
+    check that asked "does an exec work" would call this reset done on the
+    first try, and every one of those answers came from the container that
+    was still on its way down.
+    """
+    target, _counter = _identity_target(tmp_path, ["same"])
+    result = target.reset(timeout=5)
+    assert result.returncode != 0
+    assert "did not come back" in result.stderr
+
+
+def test_reset_waits_through_a_sandbox_that_is_not_up_yet(tmp_path):
+    """The other half: refusals, then a different sandbox."""
+    target, counter = _identity_target(tmp_path, ["new"], failures=3)
+    result = target.reset(timeout=30)
+    assert result.returncode == 0
+    # The pre-reset read was refused too, so there is no old identity to
+    # compare against and readiness falls back to an exec that answers.
+    assert len(counter.read_text(encoding="utf-8")) == 4
 
 
 def test_reset_reports_a_sandbox_that_never_comes_back(tmp_path):
     """A sandbox that never answers must not be reported as reset. The
     reset command's own success is not evidence that anything came back."""
-    target, _counter = _counting_target(tmp_path, failures=1000)
+    target, _counter = _identity_target(tmp_path, ["never"], failures=1000)
     result = target.reset(timeout=5)
     assert result.returncode != 0
-    assert "did not accept an exec" in result.stderr
+    assert "did not come back" in result.stderr
 
 
-def test_readiness_requires_an_exec_that_survives_a_moment(tmp_path):
-    """One exec that returns is not proof the sandbox is back.
+def test_readiness_falls_back_to_an_exec_that_survives_a_moment(tmp_path):
+    """Not every sandbox exposes an init process to read a start time from.
 
-    `docker compose restart` returns before the container has stopped, so a
-    readiness check that only asks "does an exec succeed right now" gets its
-    answer from the container that is about to be killed. The next probe
-    then starts a long payload and loses it partway through. Readiness has
-    to ask the sandbox to still be there in a moment, not merely to answer.
+    When the identity cannot be read at all, readiness asks for an exec that
+    survives an interval instead. Weaker, and the docstring in target.py
+    says so, but it is the strongest question left when the sandbox will not
+    answer the first one.
     """
-    target, _counter = _counting_target(tmp_path, failures=0)
     recorded = tmp_path / "stdin"
-    script = tmp_path / "recording-exec.sh"
+    script = tmp_path / "silent-exec.sh"
     script.write_text(f'#!/bin/sh\ncat > "{recorded}"\nexit 0\n', encoding="utf-8")
     script.chmod(0o755)
-    object.__setattr__(target, "exec_command", [str(script)])
+    target = load_target(_write(tmp_path, dict(
+        _MINIMAL, exec_command=[str(script)], reset_command=["true"],
+    )))
     assert target.reset(timeout=30).returncode == 0
     assert "sleep" in recorded.read_text(encoding="utf-8")
 
 
 def test_a_failed_reset_command_is_not_followed_by_a_wait(tmp_path):
-    """No point waiting for a sandbox nobody asked to restart."""
-    target, counter = _counting_target(tmp_path, failures=0)
+    """No point waiting for a sandbox nobody managed to restart.
+
+    One exec still happens: the identity has to be read before the reset,
+    because afterwards there is nothing left to compare against. What must
+    not happen is the polling.
+    """
+    target, counter = _identity_target(tmp_path, ["new"])
     object.__setattr__(target, "reset_command", ["false"])
     result = target.reset(timeout=5)
     assert result.returncode != 0
-    assert counter.read_text(encoding="utf-8") == ""
+    assert len(counter.read_text(encoding="utf-8")) == 1
 
 
 def test_reset_without_a_reset_command_is_unchanged(tmp_path):

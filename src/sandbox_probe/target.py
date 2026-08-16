@@ -71,7 +71,7 @@ class Target:
         return self._read(self.events_command, timeout)
 
     def reset(self, timeout: int = 60) -> ExecResult:
-        """Reset the sandbox, then wait until it can actually take work.
+        """Reset the sandbox, then wait until it is a different sandbox.
 
         A reset command that has returned is not the same as a sandbox that
         is ready, and the gap between the two is silent. Container runtimes
@@ -82,29 +82,64 @@ class Target:
         exactly like the defect this tool exists to find, which makes it
         the most expensive possible way to be wrong.
 
+        Asking whether an exec succeeds does not establish it, and neither
+        does asking for an exec that lasts a moment. Stopping the reference
+        sandbox takes a measured 10.1 seconds and ends in SIGKILL, because
+        `sleep infinity` does not die on SIGTERM, and the container answers
+        execs for most of that. Any question of the form "does it respond
+        now" is answered by the sandbox that is on its way down.
+
+        So the question is whether it is a *different* sandbox: the start
+        time of its init process, read before the reset and compared after.
+        A container that has not restarted yet cannot produce a new one, and
+        no duration has to be guessed, which matters because the guess would
+        have to hold on a slower host and under a longer stop grace period.
+
         So readiness is established rather than assumed. If it never
         arrives, that is returned as a failure of the reset itself, which
         is the honest place to put it.
         """
+        before = self._identity()
         outcome = self._read(self.reset_command, timeout)
         if outcome.returncode != 0:
             return outcome
-        return self._await_ready(outcome)
+        return self._await_ready(outcome, before)
 
-    # The readiness payload asks the sandbox to still be there in a moment,
-    # rather than merely to answer. `docker compose restart` returns before
-    # the container has stopped, so an exec issued the instant it returns is
-    # answered by the container that is about to be killed: readiness looks
-    # established, the next probe starts a payload that takes half a minute,
-    # and the stop lands in the middle of it. What comes back is exit 137,
-    # an empty result and a failed positive control, on a sandbox that is
-    # fine. An exec that survives an interval cannot be answered by a
-    # container that is on its way down.
+    # PID 1's start time, in clock ticks since the host booted. It changes
+    # when the sandbox's init process is replaced and cannot be changed by a
+    # container that is merely on its way down, which is the whole point.
+    # Field 22 of /proc/1/stat, counted after the comm field, because comm
+    # can itself contain spaces and brackets.
+    _IDENTITY_PAYLOAD = (
+        "import sys\n"
+        "try:\n"
+        "    with open('/proc/1/stat') as handle:\n"
+        "        sys.stdout.write(handle.read().rsplit(')', 1)[1].split()[19])\n"
+        "except (OSError, IndexError):\n"
+        "    pass\n"
+    )
+
+    # The fallback, for a sandbox that will not report an identity at all.
+    # Weaker on purpose and weaker in fact: an exec that survives an interval
+    # can still be answered by a container with a longer stop ahead of it.
+    # It is the strongest question left when the first one has no answer.
     _READY_PAYLOAD = "import time\ntime.sleep(2)\n"
 
-    def _await_ready(self, outcome: ExecResult, attempts: int = 30) -> ExecResult:
+    def _identity(self) -> str:
+        """What this sandbox is, or an empty string if it will not say."""
+        result = _run(self.exec_command, stdin=self._IDENTITY_PAYLOAD, timeout=15)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _is_back(self, before: str) -> bool:
+        if before:
+            # An empty answer here is an exec that failed, which is a sandbox
+            # that is not back yet rather than one that changed.
+            return self._identity() not in ("", before)
+        return _run(self.exec_command, stdin=self._READY_PAYLOAD, timeout=15).returncode == 0
+
+    def _await_ready(self, outcome: ExecResult, before: str = "", attempts: int = 60) -> ExecResult:
         for remaining in range(attempts - 1, -1, -1):
-            if _run(self.exec_command, stdin=self._READY_PAYLOAD, timeout=15).returncode == 0:
+            if self._is_back(before):
                 return outcome
             if remaining:
                 time.sleep(0.5)
@@ -112,10 +147,11 @@ class Target:
             returncode=126,
             stdout="",
             stderr=(
-                "the reset command succeeded but the sandbox did not accept an "
-                f"exec within {attempts // 2} seconds, so it was never confirmed "
-                "ready and anything measured after this point would be measuring "
-                "a sandbox in an unknown state"
+                "the reset command succeeded but the sandbox did not come back: "
+                f"{attempts} checks found no sandbox that could take work and was "
+                "not the one that was there before the reset. It was never "
+                "confirmed ready, and anything measured after this point would be "
+                "measuring a sandbox in an unknown state"
             ),
         )
 
