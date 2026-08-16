@@ -21,7 +21,16 @@ of an ordinary Linux filesystem):
   surfaced as its own error rather than silently discarded or allowed to
   overwrite the write result (see write_marker below and Finding 1/2 of
   the review that added this).
-- /proc/1/environ: another process's environment.
+- /proc/1/environ: the environment of a process the sandbox does not own,
+  established by comparing /proc/1's owning uid against the payload's own
+  before the read is attempted. An unconditional read here is not a signal.
+  Reading the environ of a same-uid process in the same PID namespace is
+  ordinary procfs behavior and succeeds in every container that runs its
+  workload under one uid, the compliant reference sandbox included, where
+  PID 1 is the sandbox's own init holding the environment the payload
+  already has. Yama does not change that: ptrace_scope only tracks
+  PTRACE_MODE_ATTACH, while /proc/pid/environ is read under
+  PTRACE_MODE_READ, so the ordinary same-uid check is what applies.
 - container runtime sockets: docker.sock, containerd.sock, crio.sock.
 
 /home, /var/lib, and a bare /root listing are deliberately not probed: they
@@ -82,12 +91,33 @@ for path in ('/host', '/hostfs'):
         pass
 result['listed_outside'] = sorted(listed)
 
-try:
-    with open('/proc/1/environ', 'rb') as handle:
-        handle.read(1)
-    result['proc_environ'] = True
-except OSError:
-    result['proc_environ'] = False
+def foreign_process_environ():
+    # Reading the environment of a process running under the same uid in the
+    # same PID namespace is ordinary procfs behavior, not a containment
+    # failure. In a correctly built sandbox PID 1 is the sandbox's own init
+    # running as the same unprivileged uid as this payload, and its
+    # environment is the environment this payload already has, so reading it
+    # exposes nothing. The finding is being able to read a process the
+    # sandbox does not own, which needs root or CAP_SYS_PTRACE and is what a
+    # sandbox sharing a PID namespace with privileged processes gives away.
+    #
+    # Ownership is established before the read, not inferred from it. No
+    # ownership fact means no finding: a stat that fails cannot support a
+    # claim about whose process this is.
+    try:
+        owner = os.stat('/proc/1').st_uid
+    except OSError:
+        return False
+    if owner == os.getuid():
+        return False
+    try:
+        with open('/proc/1/environ', 'rb') as handle:
+            handle.read(1)
+    except OSError:
+        return False
+    return True
+
+result['proc_environ'] = foreign_process_environ()
 
 sockets = []
 for path in ('/var/run/docker.sock', '/run/docker.sock',
@@ -197,8 +227,11 @@ class FilesystemProbe:
                 rule_key="proc_environ", severity=Severity.MEDIUM,
                 title="Another process environment is readable",
                 evidence=(
-                    "/proc/1/environ was readable, which exposes the environment "
-                    "of a process the sandbox does not own."
+                    "/proc/1/environ was readable and PID 1 runs as a different "
+                    "user than the sandbox payload, so the sandbox can read the "
+                    "environment of a process it does not own. That needs root "
+                    "or CAP_SYS_PTRACE, and process environments are where "
+                    "credentials sit."
                 ),
             ))
         for path in inner.get("runtime_sockets", []):

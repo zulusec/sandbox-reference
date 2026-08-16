@@ -202,12 +202,31 @@ def test_payload_uses_no_setdefault():
 # stdlib only, no sandbox and no Docker required. This is the same
 # technique network.py's tests use for proxy_allows and parse_proxy.
 
-def _load_write_marker():
-    prefix, marker, _ = PAYLOAD_BODY.partition("\nreadable = []")
-    assert marker, "PAYLOAD_BODY layout changed; update the split point in this test"
+def _load_payload_function(name):
+    """Exec one def block out of PAYLOAD_BODY and return the function.
+
+    The payload has to be a single source string, because it is piped into
+    an interpreter inside the target, so a test that wants to exercise one
+    of its functions has to carve that function out. The block runs from
+    its `def` line to the first following line that is neither blank nor
+    indented.
+    """
+    lines = PAYLOAD_BODY.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(f"def {name}(")),
+        None,
+    )
+    assert start is not None, f"PAYLOAD_BODY defines no {name}(); update this test"
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith((" ", "\t"))):
+        end += 1
     namespace: dict = {"os": os}
-    exec(prefix, namespace)  # noqa: S102 -- exercising the payload's own source
-    return namespace["write_marker"]
+    exec("\n".join(lines[start:end]), namespace)  # noqa: S102 -- the payload's own source
+    return namespace[name]
+
+
+def _load_write_marker():
+    return _load_payload_function("write_marker")
 
 
 def test_write_marker_reports_write_and_removal_success():
@@ -241,3 +260,57 @@ def test_write_marker_surfaces_a_failed_remove_without_losing_the_write():
             # up what write_marker could not, keeping this test's own
             # tmpdir teardown honest.
             os.remove(marker_path)
+
+
+# --- Task 15, live run against the reference sandbox.
+#
+# The unconditional read of /proc/1/environ reported a finding against the
+# compliant reference sandbox, and the same finding against the leaky
+# fixture, so it discriminated nothing while breaking the clean-reference
+# discipline. The project ledger expected Yama's ptrace_scope=1 to deny the
+# read; it does not, because Yama only tracks PTRACE_MODE_ATTACH and
+# /proc/pid/environ is read under PTRACE_MODE_READ. What applies is the
+# ordinary same-uid check, which succeeds: in the reference sandbox PID 1
+# is the sandbox's own `sleep infinity` running as uid 10001, the same uid
+# as the payload, holding the environment the payload already has.
+#
+# The rule's own title and evidence have always said "a process the sandbox
+# does not own". These tests hold the payload to that.
+
+def test_foreign_process_environ_ignores_a_process_the_sandbox_owns():
+    """The exact reference-sandbox case: same uid, same PID namespace."""
+    foreign = _load_payload_function("foreign_process_environ")
+    opener = mock.mock_open(read_data=b"PATH=/usr/bin\x00")
+    with mock.patch("os.getuid", return_value=10001), \
+         mock.patch("os.stat", return_value=mock.Mock(st_uid=10001)), \
+         mock.patch("builtins.open", opener):
+        assert foreign() is False
+    opener.assert_not_called()
+
+
+def test_foreign_process_environ_reports_a_process_owned_by_another_uid():
+    """A readable environ belonging to another user means root or
+    CAP_SYS_PTRACE, which is the containment failure the rule is named
+    for."""
+    foreign = _load_payload_function("foreign_process_environ")
+    with mock.patch("os.getuid", return_value=10001), \
+         mock.patch("os.stat", return_value=mock.Mock(st_uid=0)), \
+         mock.patch("builtins.open", mock.mock_open(read_data=b"AWS_SECRET_ACCESS_KEY=x\x00")):
+        assert foreign() is True
+
+
+def test_foreign_process_environ_is_false_when_the_read_is_denied():
+    foreign = _load_payload_function("foreign_process_environ")
+    with mock.patch("os.getuid", return_value=10001), \
+         mock.patch("os.stat", return_value=mock.Mock(st_uid=0)), \
+         mock.patch("builtins.open", side_effect=OSError("permission denied")):
+        assert foreign() is False
+
+
+def test_foreign_process_environ_is_false_when_pid_one_cannot_be_stated():
+    """No way to tell whose process it is means no finding, rather than a
+    finding asserted on an ownership fact that was never established."""
+    foreign = _load_payload_function("foreign_process_environ")
+    with mock.patch("os.getuid", return_value=10001), \
+         mock.patch("os.stat", side_effect=OSError("no such file")):
+        assert foreign() is False
