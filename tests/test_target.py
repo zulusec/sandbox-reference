@@ -72,3 +72,27 @@ def test_proxy_must_be_a_string(tmp_path):
     with pytest.raises(TargetConfigError) as excinfo:
         load_target(_write(tmp_path, dict(_MINIMAL, proxy=3128)))
     assert "proxy" in str(excinfo.value)
+
+
+def test_loads_a_target_with_a_wallclock_limit(tmp_path):
+    target = load_target(_write(tmp_path, dict(_MINIMAL, wallclock_limit_seconds=300)))
+    assert target.wallclock_limit_seconds == 300
+
+
+def test_wallclock_limit_defaults_to_none(tmp_path):
+    target = load_target(_write(tmp_path, _MINIMAL))
+    assert target.wallclock_limit_seconds is None
+
+
+def test_wallclock_limit_must_be_an_integer(tmp_path):
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, wallclock_limit_seconds="300")))
+    assert "wallclock_limit_seconds" in str(excinfo.value)
+
+
+def test_wallclock_limit_rejects_a_bool(tmp_path):
+    """bool is a subclass of int in Python; True/False must not silently pass
+    as valid second counts."""
+    with pytest.raises(TargetConfigError) as excinfo:
+        load_target(_write(tmp_path, dict(_MINIMAL, wallclock_limit_seconds=True)))
+    assert "wallclock_limit_seconds" in str(excinfo.value)

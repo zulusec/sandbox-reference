@@ -11,5 +11,6 @@
   "allowed_host": "example.invalid",
   "blocked_host": "blocked.invalid",
   "c2_hosts": ["paste.invalid", "requestcapture.invalid", "filedrop.invalid"],
-  "proxy": "broker:3128"
+  "proxy": "broker:3128",
+  "wallclock_limit_seconds": 300
 }

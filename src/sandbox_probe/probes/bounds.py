@@ -14,13 +14,18 @@ instead. Both are treated as uncapped; anything else, including 256 MiB
 worth of bytes, reads as capped because it sits far below that sentinel.
 
 There is no cgroup file for wall-clock time; cgroups bound memory, PIDs, and
-CPU shares, not elapsed real time, and neither the reference nor the leaky
-compose file configures a `cpus:` quota that could stand in for one. The
-actual mechanism that bounds how long a task may run here is the harness's
-own exec deadline (Target.run_inside's timeout argument), so this probe
-reports on that rather than inventing a sandbox-side signal that does not
-exist. That is a live-verification concern carried forward rather than
-silently assumed: see the task report for the full reasoning.
+CPU shares, not elapsed real time. A wall-clock bound genuinely does not
+live inside the sandbox: it lives in whatever invokes the task, an agent
+framework's task timeout, a Kubernetes activeDeadlineSeconds, a CI job
+timeout. That is not a gap in the invariant, it is a fact about where the
+control sits. So this is modeled the way reset_command already is: as a
+target-declared capability, Target.wallclock_limit_seconds. If the target
+declares one, the invariant is satisfied; if not, wallclock_uncapped fires.
+The harness cannot verify a declared limit is actually enforced without
+deliberately hanging a task for the full duration, which would be a
+terrible thing to put in a test suite and would hang forever against a
+target with no limit, so the finding says the target declares no wall-clock
+bound, never that one was tested and found wanting.
 
 Disposability is tested by writing a marker, requesting a reset, and looking
 again. Persistence across runs is what turns one bad task into a foothold,
@@ -76,8 +81,6 @@ result['memory_capped'] = cgroup_capped(memory)
 
 pids = read_first(['/sys/fs/cgroup/pids.max', '/sys/fs/cgroup/pids/pids.max'])
 result['pids_capped'] = bool(pids and pids != {_CGROUP_MAX!r})
-
-result['wallclock_capped'] = os.environ.get('PROBE_WALLCLOCK_LIMIT') is not None
 
 marker = os.path.join(os.getcwd(), {_MARKER_NAME!r})
 result['marker_present'] = os.path.exists(marker)
@@ -137,14 +140,27 @@ class BoundsProbe:
                     "can exhaust the host."
                 ),
             ))
-        if not first.get("wallclock_capped"):
+        if not first.get("pids_capped"):
+            findings.append(Finding(
+                probe_id=self.probe_id, subject=target.name,
+                rule_key="pids_uncapped", severity=Severity.MEDIUM,
+                title="No process count limit is configured",
+                evidence=(
+                    "The sandbox cgroup reports no pids ceiling, so one task "
+                    "can fork-bomb the host."
+                ),
+            ))
+        if target.wallclock_limit_seconds is None:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="wallclock_uncapped", severity=Severity.MEDIUM,
                 title="No wall-clock limit is configured",
                 evidence=(
-                    "No execution deadline was in force for this task, so it "
-                    "could have run indefinitely."
+                    "The target declares no wall-clock bound. A wall-clock cap "
+                    "is enforced by whatever invokes the task (an agent "
+                    "framework's task timeout, a scheduler deadline, a CI job "
+                    "timeout), not by the sandbox itself, and nothing here "
+                    "declares one."
                 ),
             ))
 
@@ -228,7 +244,6 @@ class BoundsProbe:
         payload = emit(
             f"os.environ['PROBE_WRITE_MARKER'] = {'1' if write_marker else '0'!r}\n"
             f"os.environ['PROBE_REMOVE_MARKER'] = {'1' if remove_marker else '0'!r}\n"
-            f"os.environ['PROBE_WALLCLOCK_LIMIT'] = {str(_TIMEOUT)!r}\n"
             + PAYLOAD_BODY
         )
         executed = target.run_inside([payload], timeout=_TIMEOUT)

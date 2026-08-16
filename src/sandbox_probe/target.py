@@ -42,6 +42,7 @@ class Target:
     events_command: list[str] | None = None
     reset_command: list[str] | None = None
     proxy: str | None = None
+    wallclock_limit_seconds: int | None = None
 
     def run_inside(self, payload_argv: list[str], timeout: int) -> ExecResult:
         """Run the inner payload inside the sandbox and capture its output."""
@@ -104,6 +105,15 @@ def load_target(path: str | Path) -> Target:
     if proxy is not None and not isinstance(proxy, str):
         raise TargetConfigError("proxy must be a string")
 
+    # bool is a subclass of int in Python, so it is excluded explicitly:
+    # True/False must not silently pass as valid second counts.
+    wallclock_limit_seconds = raw.get("wallclock_limit_seconds")
+    if wallclock_limit_seconds is not None and (
+        isinstance(wallclock_limit_seconds, bool)
+        or not isinstance(wallclock_limit_seconds, int)
+    ):
+        raise TargetConfigError("wallclock_limit_seconds must be an integer")
+
     return Target(
         name=raw["name"],
         exec_command=raw["exec_command"],
@@ -114,4 +124,5 @@ def load_target(path: str | Path) -> Target:
         events_command=raw.get("events_command"),
         reset_command=raw.get("reset_command"),
         proxy=proxy,
+        wallclock_limit_seconds=wallclock_limit_seconds,
     )
