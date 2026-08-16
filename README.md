@@ -6,10 +6,11 @@ A harness that asks whether a sandbox you run an AI agent in actually enforces
 six containment invariants: no ambient network, no ambient credentials, no
 ambient filesystem, bounded and disposable, attributable, and detected. It
 ships six probes, a minimal reference sandbox that passes them, and a
-deliberately leaky fixture that fails them. The probes are vendor neutral: a
-target is anything the harness can run a command inside, described by a small
-JSON config, so the same six probes work against Compose on a laptop, a
-virtual machine over SSH, or anything else that can exec.
+deliberately leaky fixture that fails them. The probes are built to be vendor
+neutral: a target is anything the harness can run a command inside, described
+by a small JSON config, so the same six probes are meant to work against
+Compose on a laptop, a virtual machine over SSH, or anything else that can
+exec. Compose is the only shape demonstrated in this repository.
 
 Its sibling repository is
 [`posture-reference`](https://github.com/zulusec/posture-reference), which
@@ -182,6 +183,20 @@ Full detail is in [`fixtures/leaky/README.md`](fixtures/leaky/README.md).
 
 Each invariant gets one probe. Every finding carries a `rule_key` and a fixed
 severity, so a result can be diffed between runs and tracked over time.
+
+These tables are the full reference of all 23 rule keys, not a list of what
+the demo above exercises. The leaky fixture trips nine of them end to end, and
+they are exactly the nine in its output: `blocked_egress`, `env_secret`,
+`outside_workspace`, `runtime_socket`, `no_request_log`, `no_event_channel`,
+`no_reset_configured`, `memory_uncapped`, `wallclock_uncapped`. The other
+fourteen (`dns_canary`, `c2_channel`, `credential_file`, `imds_reachable`,
+`imds_hop_limit`, `proc_environ`, `workspace_missing`, `pids_uncapped`,
+`persists_across_runs`, `crossing_unlogged`, `decision_missing`,
+`violation_unalerted`, `severity_understated`, `channel_not_separated`) are
+covered by unit tests only, because no fixture here reproduces the condition
+each one detects. `proc_environ` is the clearest case: the leaky container
+runs as uid 0 and its PID 1 is uid 0, so the scan finds no foreign-uid process
+to read.
 
 ### 1. No ambient network, and the broker is not a trusted zone
 
