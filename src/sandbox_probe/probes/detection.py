@@ -24,9 +24,9 @@ surfaces as a ProbeError naming both counts rather than an empty delta that
 reads as "nothing alerted", which would be indistinguishable from a real
 detection failure.
 
-The brief's channel_not_separated check compared the parsed event channel
-against the parsed request log for equality and fired when they matched.
-Under whole-file reads that was a coherent, if crude, test: an event
+The obvious way to write channel_not_separated is to compare the parsed
+event channel against the parsed request log for equality and fire when
+they match. Under whole-file reads that is coherent, if crude: an event
 channel byte-identical to the request log is obviously not a distinct
 alert path. Under delta comparison it stops meaning anything, because the
 two deltas come from different files read at different times over the same
@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import json
 
+from sandbox_probe.evidence import safe_text
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -128,11 +129,16 @@ def cross_direct(host, port=80, timeout=3):
     # attempt, and against a genuinely contained sandbox it will not reach
     # anything an event or request channel records. That is expected, not
     # a bug in the probe.
+    #
+    # Returns whether the connection opened. Nothing in this payload acts
+    # on the answer, because the crossing counts as attempted either way,
+    # but a function that reports what it did can be tested against a real
+    # listener rather than only inspected for its name.
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            pass
+            return True
     except OSError:
-        pass
+        return False
 
 hosts = json.loads(os.environ['PROBE_CROSSING_HOSTS'])
 proxy = os.environ.get('PROBE_PROXY') or None
@@ -314,7 +320,8 @@ class DetectionProbe:
                 title="A policy violation alerted below the expected severity",
                 evidence=(
                     f"the event for {blocked} was raised at "
-                    f"{matching[0].get('severity')} rather than {_EXPECTED_SEVERITY}. "
+                    f"{safe_text(matching[0].get('severity'))} rather than "
+                    f"{_EXPECTED_SEVERITY}. "
                     "An alert nobody escalates is an alert nobody answers."
                 ),
             ))

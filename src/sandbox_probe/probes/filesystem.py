@@ -19,8 +19,9 @@ of an ordinary Linux filesystem):
   writability is removed immediately. Write and removal are tracked
   separately: if the write succeeds but the removal fails, that is
   surfaced as its own error rather than silently discarded or allowed to
-  overwrite the write result (see write_marker below and Finding 1/2 of
-  the review that added this).
+  overwrite the write result (see write_marker below). A stray marker left
+  in a system directory must be reported, and a removal that failed must
+  never make a successful write read as a failed one.
 - /proc/<pid>/environ across every visible process: the environment of any
   process the sandbox does not own, established by comparing that process's
   owning uid against the payload's own before the read is attempted.
@@ -66,6 +67,7 @@ guaranteed on the compliant reference sandbox too and carries no signal.
 
 from __future__ import annotations
 
+from sandbox_probe.evidence import LIST_LIMIT, bounded, overflow_finding
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -73,11 +75,6 @@ from sandbox_probe.result import ProbeError, ProbeOutcome
 from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
-
-# How many distinct owning uids the proc_environ evidence will name before it
-# summarizes the rest. inner comes from the system under test, so the bound
-# lives on this side of the boundary.
-_UID_LIMIT = 16
 
 PAYLOAD_BODY = """
 def write_marker(base):
@@ -260,11 +257,13 @@ def _foreign_environ_evidence(count: int, uids: list) -> str:
 
     The uid list is bounded here rather than in the payload because inner
     comes from the system under test, and a hostile target must not be able
-    to write an unbounded string into this harness's report.
+    to write an unbounded string into this harness's report. The bound is
+    the shared one every probe uses on a target-supplied list, so there is
+    one number to reason about rather than one per probe.
     """
-    shown = ", ".join(str(uid) for uid in uids[:_UID_LIMIT])
-    if len(uids) > _UID_LIMIT:
-        shown = f"{shown} and {len(uids) - _UID_LIMIT} more"
+    shown = ", ".join(str(uid) for uid in uids[:LIST_LIMIT])
+    if len(uids) > LIST_LIMIT:
+        shown = f"{shown} and {len(uids) - LIST_LIMIT} more"
     owner_noun = "uid" if len(uids) == 1 else "uids"
     owners = f"{len(uids)} distinct owning {owner_noun} ({shown})" if uids else (
         "an unrecorded set of owning uids"
@@ -304,16 +303,21 @@ class FilesystemProbe:
                 control_ok=False,
             )
 
+        # Every path below arrived from inside the sandbox, so every one of
+        # them is cleaned and bounded before it reaches a finding or an
+        # error. Both of those get written to an operator's terminal.
         findings = []
         errors = []
-        for path in inner.get("readable_outside", []):
+        readable, dropped_readable = bounded(inner.get("readable_outside"))
+        for path in readable:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
                 title="A path outside the workspace is readable",
                 evidence=f"{path} was read from inside the sandbox",
             ))
-        for path in inner.get("listed_outside", []):
+        listed, dropped_listed = bounded(inner.get("listed_outside"))
+        for path in listed:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
@@ -323,7 +327,8 @@ class FilesystemProbe:
                     "marker directory should not exist at all in a contained sandbox."
                 ),
             ))
-        for path in inner.get("writable_outside", []):
+        writable_paths, dropped_writable = bounded(inner.get("writable_outside"))
+        for path in writable_paths:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
@@ -334,12 +339,28 @@ class FilesystemProbe:
                     "declared workspace should be writable."
                 ),
             ))
-        for path in inner.get("cleanup_failed_outside", []):
+        dropped_outside = dropped_readable + dropped_listed + dropped_writable
+        if dropped_outside:
+            findings.append(overflow_finding(
+                probe_id=self.probe_id, subject=target.name,
+                rule_key="outside_workspace", severity=Severity.HIGH,
+                dropped=dropped_outside, kind="paths outside the workspace",
+            ))
+        stray, dropped_stray = bounded(inner.get("cleanup_failed_outside"))
+        for path in stray:
             errors.append(ProbeError(
                 self.probe_id, target.name, "cleanup",
                 f"wrote a marker file into {path} to test writability but could "
                 "not remove it afterward; .sandbox_probe_write_check may remain "
                 "there. The write itself is still reported above.",
+            ))
+        if dropped_stray:
+            errors.append(ProbeError(
+                self.probe_id, target.name, "cleanup",
+                f"{dropped_stray} further paths were reported as holding a marker "
+                "file that could not be removed. They are counted rather than "
+                "listed: the list comes from the system under test and is bounded "
+                f"at {LIST_LIMIT} entries.",
             ))
         foreign_count = _foreign_count(inner.get("foreign_environ_count"))
         if foreign_count:
@@ -351,7 +372,8 @@ class FilesystemProbe:
                     foreign_count, _foreign_uids(inner.get("foreign_environ_uids")),
                 ),
             ))
-        for path in inner.get("runtime_sockets", []):
+        sockets, dropped_sockets = bounded(inner.get("runtime_sockets"))
+        for path in sockets:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="runtime_socket", severity=Severity.HIGH,
@@ -360,6 +382,12 @@ class FilesystemProbe:
                     f"{path} exists. Access to the runtime socket is equivalent "
                     "to control of the host."
                 ),
+            ))
+        if dropped_sockets:
+            findings.append(overflow_finding(
+                probe_id=self.probe_id, subject=target.name,
+                rule_key="runtime_socket", severity=Severity.HIGH,
+                dropped=dropped_sockets, kind="runtime sockets",
             ))
 
         writable = bool(inner.get("workspace_writable"))

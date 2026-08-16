@@ -2,6 +2,7 @@ import json
 import socket
 import threading
 
+from sandbox_probe.evidence import LIST_LIMIT
 from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.network import PAYLOAD_BODY, NetworkProbe
 from sandbox_probe.target import ExecResult, Target
@@ -88,10 +89,10 @@ def test_unparseable_inner_output_is_an_error_not_a_pass():
 def test_exec_failure_detail_includes_returncode_and_stderr():
     """A dead container and a timeout must not both read as the same mystery.
 
-    Finding 4: previously every unparseable-output cause collapsed into
-    'inner payload produced no marked result line', discarding the
-    returncode and stderr Target.run_inside already captured for exactly
-    this situation (see target.py's timeout and exec-failure branches).
+    Without the returncode and stderr folded in, every unparseable-output
+    cause collapses into 'inner payload produced no marked result line',
+    discarding what Target.run_inside already captured for exactly this
+    situation (see target.py's timeout and exec-failure branches).
     """
     target = _target({})
     object.__setattr__(
@@ -106,7 +107,7 @@ def test_exec_failure_detail_includes_returncode_and_stderr():
 
 
 def test_non_dict_inner_result_is_an_error_not_a_crash():
-    """Finding 5: parse_inner returns whatever json.loads produced.
+    """parse_inner returns whatever json.loads produced.
 
     A marked line carrying a JSON scalar must not raise AttributeError out
     of run(); it must become a ProbeError like any other protocol failure.
@@ -123,7 +124,7 @@ def test_non_dict_inner_result_is_an_error_not_a_crash():
     assert outcome.findings == []
 
 
-# --- Amendment: the positive control is proxy-aware, not direct-reachability-only.
+# --- The positive control is proxy-aware, not direct-reachability-only.
 #
 # In a correctly contained sandbox (like the reference target) nothing is
 # directly reachable, so the control has to go through the egress broker
@@ -169,7 +170,7 @@ def test_no_proxy_target_falls_back_to_direct_reachability():
 
 
 def test_probe_env_vars_use_direct_assignment_not_setdefault():
-    """Finding 3: the sandbox's own environment must never choose what is measured.
+    """The sandbox's own environment must never choose what is measured.
 
     A preset PROBE_PROXY is the worst case: it would flip a no-proxy target
     onto the (trivially satisfiable) proxy control branch. setdefault lets
@@ -186,13 +187,13 @@ def test_probe_env_vars_use_direct_assignment_not_setdefault():
         assert f"os.environ['{var}'] = " in payload
 
 
-# --- Finding 1 and Finding 2: the inner proxy control logic itself.
+# --- The inner proxy control logic itself.
 #
 # PAYLOAD_BODY is a module-level string by design, so its function
 # definitions (everything above the environment-variable reads at the
 # bottom) can be exec'd directly and exercised against a real loopback
 # socket, stdlib only, no sandbox and no Docker required. This is the only
-# way to prove proxy_allows and parse_proxy actually do what the amendment
+# way to prove proxy_allows and parse_proxy actually do what the control
 # requires, rather than just checking that the right strings landed in an
 # env var.
 
@@ -239,8 +240,8 @@ def test_proxy_allows_accepts_a_502_and_sends_absolute_uri_form():
     thread.join(timeout=3)
     assert result is True
     # Pins the absolute-URI requirement: origin form ('GET / HTTP/1.0' with a
-    # Host header) is the exact regression the amendment bans, because it
-    # makes the reference broker log the path as the hostname.
+    # Host header) is the exact regression this bans, because it makes the
+    # reference broker log the path as the hostname.
     assert received[0].startswith(b"GET http://allowed.invalid/ HTTP/1.0")
 
 
@@ -262,9 +263,8 @@ def test_proxy_allows_fails_closed_on_an_unreachable_port():
 
 
 def test_proxy_allows_fails_closed_on_a_malformed_proxy_value():
-    """Reproduces the reviewer's finding exactly: a config typo must fail
-    closed inside proxy_allows, not raise past it and discard every other
-    measurement this payload took."""
+    """A config typo must fail closed inside proxy_allows, not raise past
+    it and discard every other measurement this payload took."""
     functions = _load_payload_functions()
     assert functions["proxy_allows"]("broker:abc", "allowed.invalid") is False
     assert functions["proxy_allows"]("broker", "allowed.invalid") is False
@@ -274,3 +274,80 @@ def test_parse_proxy_strips_ipv6_brackets_like_the_broker_does():
     functions = _load_payload_functions()
     assert functions["parse_proxy"]("[::1]:3128") == ("::1", 3128)
     assert functions["parse_proxy"]("broker:3128") == ("broker", 3128)
+
+
+# --- The target does not choose which hosts appear in the report.
+#
+# The harness put PROBE_C2_HOSTS into the payload, so the harness decides
+# which of them count as answers. A host that was never asked about cannot
+# be a measurement of anything, and rendering it would let the system under
+# test write text of its own choosing straight to an operator's terminal.
+
+_FORGERY = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_c2_host_nobody_asked_about_is_not_reported():
+    outcome = NetworkProbe().run(_target({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": ["invented.invalid", "paste.invalid"],
+        "control_reachable": True,
+    }))
+    findings = [f for f in outcome.findings if f.rule_key == "c2_channel"]
+    assert len(findings) == 1
+    assert "paste.invalid" in findings[0].evidence
+
+
+def test_a_forged_c2_host_never_reaches_the_terminal():
+    outcome = NetworkProbe().run(_target({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": [_FORGERY], "control_reachable": True,
+    }))
+    assert outcome.findings == []
+
+
+def test_a_non_list_c2_result_is_not_walked_character_by_character():
+    """A string here would otherwise produce one finding per character."""
+    outcome = NetworkProbe().run(_target({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": "paste.invalid", "control_reachable": True,
+    }))
+    assert outcome.findings == []
+
+
+def test_c2_findings_follow_the_configs_order_not_the_targets():
+    target = Target(
+        name="t", exec_command=["true"],
+        allowed_host="allowed.invalid", blocked_host="blocked.invalid",
+        c2_hosts=["a.invalid", "b.invalid", "c.invalid"],
+    )
+    payload = f"{MARKER} " + json.dumps({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": ["c.invalid", "a.invalid", "b.invalid"],
+        "control_reachable": True,
+    }) + "\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = NetworkProbe().run(target)
+    evidence = [f.evidence for f in outcome.findings]
+    assert len(evidence) == 3
+    assert "a.invalid" in evidence[0]
+    assert "b.invalid" in evidence[1]
+    assert "c.invalid" in evidence[2]
+
+
+def test_a_huge_c2_list_is_bounded_and_the_remainder_is_counted():
+    """20000 findings from one JSON array is a denial of service against
+    whoever is reading the report. The remainder is a count, not a drop."""
+    hosts = [f"c2-{n:05d}.invalid" for n in range(200)]
+    target = Target(
+        name="t", exec_command=["true"],
+        allowed_host="allowed.invalid", blocked_host="blocked.invalid",
+        c2_hosts=hosts,
+    )
+    payload = f"{MARKER} " + json.dumps({
+        "blocked_reachable": False, "dns_resolved": False,
+        "c2_reachable": hosts, "control_reachable": True,
+    }) + "\n"
+    object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
+    outcome = NetworkProbe().run(target)
+    assert len(outcome.findings) == LIST_LIMIT + 1
+    assert str(200 - LIST_LIMIT) in outcome.findings[-1].evidence

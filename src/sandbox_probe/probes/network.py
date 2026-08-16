@@ -26,6 +26,7 @@ measuring nothing.
 
 from __future__ import annotations
 
+from sandbox_probe.evidence import bounded, overflow_finding
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -113,6 +114,12 @@ result['control_reachable'] = (
 """
 
 
+def _as_list(value) -> list:
+    """A list, or an empty one. The payload's contract is a list, and a
+    string arriving here must never be walked character by character."""
+    return value if isinstance(value, list) else []
+
+
 def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     """Fold the exec result's returncode and stderr into an error detail.
 
@@ -183,7 +190,18 @@ class NetworkProbe:
                     "exfiltration channel that an HTTP allowlist does not cover."
                 ),
             ))
-        for host in inner.get("c2_reachable", []):
+        # The harness put this host list into the payload, so the harness
+        # decides which of them count as answers. Anything else that comes
+        # back is a host nobody asked about: it cannot be a measurement of
+        # a configured c2 class, and rendering it would let the system under
+        # test write text of its choosing into this report. Intersecting
+        # also fixes the order, which the target would otherwise pick.
+        reported = {
+            host for host in _as_list(inner.get("c2_reachable"))
+            if isinstance(host, str)
+        }
+        confirmed, dropped = bounded([h for h in target.c2_hosts if h in reported])
+        for host in confirmed:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="c2_channel",
                 severity=Severity.HIGH,
@@ -193,6 +211,12 @@ class NetworkProbe:
                     "file drop hosts are staging channels whether or not they are "
                     "on the allowlist."
                 ),
+            ))
+        if dropped:
+            findings.append(overflow_finding(
+                probe_id=self.probe_id, subject=target.name, rule_key="c2_channel",
+                severity=Severity.HIGH, dropped=dropped,
+                kind="reachable staging hosts",
             ))
 
         return ProbeOutcome(

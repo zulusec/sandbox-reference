@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 
+from sandbox_probe.evidence import bounded, overflow_finding
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -178,7 +179,12 @@ class CredentialsProbe:
             )
 
         findings = []
-        for name in inner.get("env_secrets", []):
+        # Variable names are genuinely discovered inside the sandbox, so
+        # there is no harness-side list to check them against. They are
+        # cleaned and bounded instead: inner comes from the system under
+        # test, and a report is written to an operator's terminal.
+        names, dropped_names = bounded(inner.get("env_secrets"))
+        for name in names:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="env_secret",
                 severity=Severity.HIGH,
@@ -188,7 +194,25 @@ class CredentialsProbe:
                     "The value is deliberately not reproduced here."
                 ),
             ))
-        for path in inner.get("readable_paths", []):
+        if dropped_names:
+            findings.append(overflow_finding(
+                probe_id=self.probe_id, subject=target.name, rule_key="env_secret",
+                severity=Severity.HIGH, dropped=dropped_names,
+                kind="secret-shaped environment variables",
+            ))
+
+        # The candidate paths went in from here, so a path that did not is
+        # not an answer to anything this probe asked. Checking the reported
+        # set against the list the harness sent keeps the report to paths
+        # this harness named.
+        raw_paths = inner.get("readable_paths")
+        reported = {
+            item for item in (raw_paths if isinstance(raw_paths, list) else [])
+            if isinstance(item, str)
+        }
+        for path in _CREDENTIAL_PATHS:
+            if path not in reported:
+                continue
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="credential_file",
                 severity=Severity.HIGH,

@@ -9,6 +9,14 @@ reason anyone knows what happened.
 A target with no request log fails here rather than passing quietly.
 Nothing to read is the worst possible result, not the cleanest one.
 
+This probe's ground truth comes from outside the sandbox. The crossings are
+generated inside, but what counts as evidence is the broker's request log,
+read on a host the sandbox has no route to. The detection probe reads its
+event channel the same way; the other four measure by asking the sandbox
+about itself. So the comparison here is made against the crossing list this
+harness supplied, never against anything the payload reports back. The
+payload's marked line proves only that it ran to completion.
+
 requests.log is append-only and nothing resets it between runs, so a whole-
 log comparison is satisfiable by a stale entry: a host logged by an earlier
 run stays in the log forever, and a later run whose crossing genuinely
@@ -44,6 +52,7 @@ from __future__ import annotations
 
 import json
 
+from sandbox_probe.evidence import safe_text
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -106,11 +115,16 @@ def cross_direct(host, port=80, timeout=3):
     # probe: a target that offers a request log without a proxy has not
     # given us a believable route to it, and this attempt is what proves
     # that gap rather than assuming it away.
+    #
+    # Returns whether the connection opened. Nothing in this payload acts
+    # on the answer, because the crossing counts as attempted either way,
+    # but a function that reports what it did can be tested against a real
+    # listener rather than only inspected for its name.
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            pass
+            return True
     except OSError:
-        pass
+        return False
 
 hosts = json.loads(os.environ['PROBE_CROSSING_HOSTS'])
 proxy = os.environ.get('PROBE_PROXY') or None
@@ -120,8 +134,6 @@ for host in hosts:
         cross_via_proxy(proxy, host)
     else:
         cross_direct(host)
-
-result['attempted'] = hosts
 """
 
 
@@ -251,29 +263,48 @@ class AttributionProbe:
         # would let a stale entry from an earlier run mask a crossing that
         # this run's payload never actually got logged.
         entries = _parse_lines(after_lines[len(before_lines):])
-        logged_hosts = {entry.get("host") for entry in entries}
-        attempted = inner.get("attempted", [])
+        logged_hosts = {
+            entry.get("host") for entry in entries
+            if isinstance(entry.get("host"), str)
+        }
 
+        # `hosts` above, not anything the payload echoed back. The reading
+        # this comparison rests on came from outside the sandbox, from the
+        # broker's log on a host the sandbox has no route to, and that is
+        # the whole reason this probe can say something a compromised
+        # sandbox cannot contradict. Comparing that outside reading against
+        # a list the sandbox chose would hand the crossing set straight
+        # back to the system under test: a target answering with an empty
+        # list would produce no findings at all, which is a clean
+        # attribution result from a sandbox that logged nothing. The
+        # harness supplied these hosts, so the harness compares against
+        # them.
         findings = []
-        for host in attempted:
+        for host in hosts:
             if host not in logged_hosts:
                 findings.append(Finding(
                     probe_id=self.probe_id, subject=target.name,
                     rule_key="crossing_unlogged", severity=Severity.HIGH,
                     title="A boundary crossing does not appear in the request log",
                     evidence=(
-                        f"the sandbox attempted a crossing to {host} and the "
-                        "request log has no entry for it"
+                        f"the sandbox attempted a crossing to {safe_text(host)} and "
+                        "the request log has no entry for it"
                     ),
                 ))
-        for entry in entries:
-            if entry.get("host") in attempted and "decision" not in entry:
+        # One finding per host rather than one per matching line: a broker
+        # that logs the same undecided host repeatedly says nothing new each
+        # time, and the host list is what the harness controls the size of.
+        for host in hosts:
+            if any(
+                entry.get("host") == host and "decision" not in entry
+                for entry in entries
+            ):
                 findings.append(Finding(
                     probe_id=self.probe_id, subject=target.name,
                     rule_key="decision_missing", severity=Severity.MEDIUM,
                     title="A logged crossing records no decision",
                     evidence=(
-                        f"the entry for {entry.get('host')} does not say whether "
+                        f"the entry for {safe_text(host)} does not say whether "
                         "the request was allowed or denied"
                     ),
                 ))

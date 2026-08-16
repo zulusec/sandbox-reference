@@ -1,7 +1,12 @@
 import json
 
+from sandbox_probe.evidence import LIST_LIMIT
 from sandbox_probe.inner import MARKER
-from sandbox_probe.probes.credentials import CredentialsProbe, looks_secret
+from sandbox_probe.probes.credentials import (
+    _CREDENTIAL_PATHS,
+    CredentialsProbe,
+    looks_secret,
+)
 from sandbox_probe.target import ExecResult, Target
 
 
@@ -55,9 +60,8 @@ def test_readable_service_account_token_is_high():
 def test_imds_token_blocked_is_reachable_only():
     """A hop limit of 1 lets the connection open but drops the token response.
 
-    Renamed from the brief's 'reachable' fixture: the endpoint is routable
-    but the token never came back, so only imds_reachable fires, not the
-    hop-limit finding.
+    The endpoint is routable but the token never came back, so only
+    imds_reachable fires, not the hop-limit finding.
     """
     outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="token_blocked")))
     keys = {f.rule_key for f in outcome.findings}
@@ -66,9 +70,9 @@ def test_imds_token_blocked_is_reachable_only():
 
 def test_imds_token_obtained_adds_the_hop_limit_finding():
     """A token PUT response crossing the container's hop means the hop limit
-    is not doing its job. Renamed from the brief's 'reachable_no_hop_limit'
-    fixture, whose name described the opposite of this state: a body coming
-    back is the insecure case, not its absence.
+    is not doing its job. A body coming back is the insecure case, not its
+    absence, which is the opposite of what the state name suggests at first
+    reading.
     """
     outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="token_obtained")))
     keys = {f.rule_key for f in outcome.findings}
@@ -78,3 +82,48 @@ def test_imds_token_obtained_adds_the_hop_limit_finding():
 def test_credential_probe_needs_no_positive_control():
     """Absence of secrets is directly observable, unlike absence of egress."""
     assert CredentialsProbe().run(_target(_CLEAN)).control_ok
+
+
+# --- inner comes from the system under test, and evidence goes to a
+# terminal. Variable names are genuinely discovered inside the sandbox, so
+# there is no harness-side list to check them against; they are cleaned and
+# bounded instead. Credential paths are different: this probe sent the
+# candidate list in, so a path that was never sent is not an answer.
+
+_FORGERY = "\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_forged_variable_name_cannot_repaint_the_report():
+    outcome = CredentialsProbe().run(_target(dict(_CLEAN, env_secrets=[_FORGERY])))
+    finding = next(f for f in outcome.findings if f.rule_key == "env_secret")
+    assert "\x1b" not in finding.evidence
+    assert "unprintable characters removed" in finding.evidence
+
+
+def test_an_enormous_variable_name_is_truncated():
+    outcome = CredentialsProbe().run(_target(dict(_CLEAN, env_secrets=["A" * 20000])))
+    finding = next(f for f in outcome.findings if f.rule_key == "env_secret")
+    assert len(finding.evidence) < 400
+    assert "truncated from 20000 characters" in finding.evidence
+
+
+def test_a_huge_env_secret_list_is_bounded_and_the_remainder_is_counted():
+    outcome = CredentialsProbe().run(_target(dict(
+        _CLEAN, env_secrets=[f"SECRET_{n:05d}" for n in range(20000)])))
+    findings = [f for f in outcome.findings if f.rule_key == "env_secret"]
+    assert len(findings) == LIST_LIMIT + 1
+    assert str(20000 - LIST_LIMIT) in findings[-1].evidence
+
+
+def test_a_credential_path_the_probe_never_asked_about_is_not_reported():
+    outcome = CredentialsProbe().run(_target(dict(
+        _CLEAN, readable_paths=["/invented/path", _FORGERY])))
+    assert [f for f in outcome.findings if f.rule_key == "credential_file"] == []
+
+
+def test_credential_paths_are_reported_in_the_harnesss_own_order():
+    outcome = CredentialsProbe().run(_target(dict(
+        _CLEAN, readable_paths=list(reversed(_CREDENTIAL_PATHS)))))
+    reported = [f.evidence.split()[0] for f in outcome.findings
+                if f.rule_key == "credential_file"]
+    assert reported == list(_CREDENTIAL_PATHS)

@@ -3,6 +3,7 @@ import os
 import tempfile
 from unittest import mock
 
+from sandbox_probe.evidence import LIST_LIMIT
 from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.filesystem import PAYLOAD_BODY, FilesystemProbe
 from sandbox_probe.target import ExecResult, Target
@@ -17,18 +18,18 @@ def _target(inner: dict, returncode: int = 0):
     return target
 
 
-# Amendment: /home, /var/lib and a bare /root listing are dropped from the
-# candidate set because they exist and are world-listable in essentially any
-# base image, including the compliant reference sandbox. The traversal check
-# against /workspace/../etc/hostname is dropped too: /etc/hostname is
-# world-readable in every ordinary container (Docker manages it itself), so
-# keeping it as a bare content-read finding would false-positive against the
-# compliant reference sandbox exactly as readily as against the leaky
-# fixture, contradicting the requirement that the reference sandbox come
-# back with no findings at all. This mirrors Ruling R5 in the project's SDD
-# progress log, which lists the genuine signals as host-mount markers,
-# runtime sockets, /proc/1/environ, /etc/shadow as a content read, and any
-# writable path outside the declared workspace, with no traversal check.
+# /home, /var/lib and a bare /root listing are deliberately not in the
+# candidate set: they exist and are world-listable in essentially any base
+# image, including the compliant reference sandbox, so flagging them would
+# report an ordinary filesystem rather than a containment failure. A
+# traversal read of /workspace/../etc/hostname is out for the same reason.
+# /etc/hostname is world-readable in every ordinary container (Docker
+# manages the file itself), so that read succeeds identically on a contained
+# sandbox and a wide-open one and carries no signal, while contradicting the
+# requirement that the reference sandbox come back with no findings at all.
+# What is left is the set that genuinely discriminates: host-mount markers,
+# runtime sockets, foreign process environments, /etc/shadow read as content
+# rather than stat'ed, and any writable path outside the declared workspace.
 _CLEAN = {
     "readable_outside": [],
     "listed_outside": [],
@@ -212,13 +213,13 @@ def test_unwritable_workspace_fails_the_positive_control():
     assert finding.severity.value == "MEDIUM"
 
 
-# --- Fix round: a failed removal after a successful write must never be
-# silently discarded (Finding 1) and must never be allowed to relabel a
-# genuinely successful write as a failure (Finding 2).
+# --- A failed removal after a successful write must never be silently
+# discarded, and must never be allowed to relabel a genuinely successful
+# write as a failure. Write and removal are two independent facts.
 
 def test_cleanup_failure_outside_workspace_is_surfaced_as_an_error():
-    """Finding 1: a stray marker file left in a system directory must be
-    reported, not swallowed. The write itself still counts as a finding."""
+    """A stray marker file left in a system directory must be reported, not
+    swallowed. The write itself still counts as a finding."""
     outcome = FilesystemProbe().run(_target(dict(
         _CLEAN,
         writable_outside=["/etc"],
@@ -232,9 +233,9 @@ def test_cleanup_failure_outside_workspace_is_surfaced_as_an_error():
 
 
 def test_workspace_cleanup_failure_does_not_flip_the_positive_control():
-    """Finding 2: a failed removal on the workspace check must not be
-    conflated with a failed write. The workspace is still reported writable
-    and control_ok stays True; the removal failure is a separate error."""
+    """A failed removal on the workspace check must not be conflated with a
+    failed write. The workspace is still reported writable and control_ok
+    stays True; the removal failure is a separate error."""
     outcome = FilesystemProbe().run(_target(dict(
         _CLEAN,
         workspace_writable=True,
@@ -257,8 +258,9 @@ def test_unparseable_inner_output_is_an_error_not_a_pass():
 
 
 def test_exec_failure_detail_includes_returncode_and_stderr():
-    """Pattern 3, copied from network.py: a dead container and a timeout must
-    not both read as the same mystery message."""
+    """A dead container and a timeout must not both read as the same mystery
+    message. The returncode and stderr are already captured; they belong in
+    the error detail."""
     target = _target({})
     object.__setattr__(
         target, "run_inside",
@@ -272,9 +274,9 @@ def test_exec_failure_detail_includes_returncode_and_stderr():
 
 
 def test_non_dict_inner_result_is_an_error_not_a_crash():
-    """Pattern 4, copied from network.py: parse_inner returns whatever
-    json.loads produced, and a marked line carrying a JSON scalar must not
-    raise AttributeError out of run()."""
+    """parse_inner returns whatever json.loads produced, so a marked line
+    carrying a JSON scalar must not raise AttributeError out of run(). It
+    becomes a ProbeError like any other protocol failure."""
     target = _target({})
     payload = f"{MARKER} 42\n"
     object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, payload, ""))
@@ -285,20 +287,23 @@ def test_non_dict_inner_result_is_an_error_not_a_crash():
 
 
 def test_payload_uses_no_setdefault():
-    """Pattern 1, copied from network.py: this probe has no target-supplied
-    values to inject into the sandbox environment, but if one is ever added
-    it must use direct assignment, never setdefault, so a preset PROBE_*
-    variable inside the sandbox can never choose what gets measured."""
+    """This probe has no target-supplied values to inject into the sandbox
+    environment, but if one is ever added it must use direct assignment,
+    never setdefault, so a preset PROBE_* variable inside the sandbox can
+    never choose what gets measured. Every other probe follows the same
+    rule."""
     assert "setdefault" not in PAYLOAD_BODY
 
 
-# --- Finding 3: the covering test for write_marker's actual behavior.
+# --- The covering test for write_marker's actual behavior.
 #
-# PAYLOAD_BODY is a module-level string by design, so write_marker's
-# definition (everything above the first blank-line-terminated statement)
-# can be exec'd directly and exercised against a real temporary directory,
-# stdlib only, no sandbox and no Docker required. This is the same
-# technique network.py's tests use for proxy_allows and parse_proxy.
+# Asserting that PAYLOAD_BODY contains the string "def write_marker" would
+# pass against a function whose body is `pass`. PAYLOAD_BODY is a
+# module-level string by design, so write_marker's definition (everything
+# above the first blank-line-terminated statement) can be exec'd directly
+# and exercised against a real temporary directory, stdlib only, no sandbox
+# and no Docker required. This is the same technique network.py's tests use
+# for proxy_allows and parse_proxy.
 
 def _load_payload_function(name):
     """Exec one def block out of PAYLOAD_BODY and return the function.
@@ -341,9 +346,8 @@ def test_write_marker_reports_write_failure_without_attempting_removal():
 
 
 def test_write_marker_surfaces_a_failed_remove_without_losing_the_write():
-    """The exact regression both findings describe: os.remove raising after
-    a successful write must not be reported as a failed write, and must not
-    vanish silently either."""
+    """os.remove raising after a successful write must not be reported as a
+    failed write, and must not vanish silently either."""
     write_marker = _load_write_marker()
     with tempfile.TemporaryDirectory() as tmp:
         with mock.patch("os.remove", side_effect=OSError("permission denied")):
@@ -360,19 +364,20 @@ def test_write_marker_surfaces_a_failed_remove_without_losing_the_write():
             os.remove(marker_path)
 
 
-# --- Task 15, live runs against both fixtures, and the review that followed.
+# --- What live runs against both fixtures measured, and why the check has
+# the shape it does.
 #
-# The original payload read /proc/1/environ unconditionally and reported any
-# successful read. That fired against the compliant reference sandbox and
-# against the leaky fixture alike, so it discriminated nothing. The project
-# ledger expected Yama's ptrace_scope=1 to deny the read; it does not, because
-# Yama only tracks PTRACE_MODE_ATTACH and /proc/pid/environ is read under
-# PTRACE_MODE_READ. What applies is the ordinary same-uid check, which
-# succeeds: PID 1 in both fixtures is that sandbox's own init running as the
-# same uid as the payload.
+# An unconditional read of /proc/1/environ, reporting any successful read,
+# fires against the compliant reference sandbox and the leaky fixture alike,
+# so it discriminates nothing. It is tempting to expect Yama's
+# ptrace_scope=1 to deny the read; it does not, because Yama only tracks
+# PTRACE_MODE_ATTACH and /proc/pid/environ is read under PTRACE_MODE_READ.
+# What applies is the ordinary same-uid check, which succeeds: PID 1 in both
+# fixtures is that sandbox's own init running as the same uid as the
+# payload.
 #
 # Narrowing that read to a foreign owner, but keeping it pinned to PID 1,
-# discriminated nothing either. Measured live: reference sandbox 0 readable,
+# discriminates nothing either. Measured live: reference sandbox 0 readable,
 # leaky fixture 0 readable, unprivileged --pid=host 0 readable of 218
 # other-uid processes (Docker's default AppArmor profile denies the ptrace
 # read even with CAP_SYS_PTRACE), and privileged --pid=host 217 readable
@@ -525,10 +530,70 @@ def test_scan_reports_nothing_when_proc_cannot_be_listed():
 
 
 def test_scan_finds_foreign_processes_that_a_pid_one_only_check_misses():
-    """The exact regression the review measured. PID 1 belongs to the
-    payload's own uid, so any check pinned to PID 1 short-circuits and
-    reports nothing, while the sandbox can in fact read foreign process
+    """The exact regression measured live. PID 1 belongs to the payload's
+    own uid, so any check pinned to PID 1 short-circuits and reports
+    nothing, while the sandbox can in fact read foreign process
     environments elsewhere in the table."""
     entries = {"1": 10001, "88": 0, "91": 33}
     (count, uids), _ = _scan(entries, own_uid=10001, readable=[88, 91])
     assert (count, uids) == (2, [0, 33])
+
+
+# --- inner comes from the system under test, and both findings and errors
+# are written to an operator's terminal. Every path this probe reads out of
+# inner is cleaned of control characters and bounded in length and count
+# before it reaches either.
+
+_FORGERY = "/etc/shadow\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
+
+
+def test_a_forged_path_cannot_repaint_the_report():
+    outcome = FilesystemProbe().run(_target(dict(_CLEAN, readable_outside=[_FORGERY])))
+    finding = next(f for f in outcome.findings if f.rule_key == "outside_workspace")
+    assert "\x1b" not in finding.evidence
+    assert "unprintable characters removed" in finding.evidence
+
+
+def test_an_enormous_path_is_truncated():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, listed_outside=["/" + "a" * 20000])))
+    finding = next(f for f in outcome.findings if f.rule_key == "outside_workspace")
+    assert len(finding.evidence) < 500
+    assert "truncated from 20001 characters" in finding.evidence
+
+
+def test_a_huge_path_list_is_bounded_and_the_remainder_is_counted():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, writable_outside=[f"/dir{n:05d}" for n in range(20000)])))
+    findings = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
+    assert len(findings) == LIST_LIMIT + 1
+    assert str(20000 - LIST_LIMIT) in findings[-1].evidence
+
+
+def test_a_huge_runtime_socket_list_is_bounded_and_the_remainder_is_counted():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, runtime_sockets=[f"/run/{n:05d}.sock" for n in range(100)])))
+    findings = [f for f in outcome.findings if f.rule_key == "runtime_socket"]
+    assert len(findings) == LIST_LIMIT + 1
+    assert str(100 - LIST_LIMIT) in findings[-1].evidence
+
+
+def test_a_forged_cleanup_path_cannot_repaint_the_report_through_an_error():
+    """Errors render to the same terminal findings do, so the same bound
+    applies to them."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, writable_outside=["/etc"], cleanup_failed_outside=[_FORGERY])))
+    assert outcome.errors
+    assert "\x1b" not in outcome.errors[0].detail
+
+
+def test_a_huge_cleanup_list_is_bounded_and_the_remainder_is_counted():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, cleanup_failed_outside=[f"/dir{n:05d}" for n in range(100)])))
+    assert len(outcome.errors) == LIST_LIMIT + 1
+    assert str(100 - LIST_LIMIT) in outcome.errors[-1].detail
+
+
+def test_a_non_list_path_result_is_not_walked_character_by_character():
+    outcome = FilesystemProbe().run(_target(dict(_CLEAN, readable_outside="/etc/shadow")))
+    assert outcome.findings == []

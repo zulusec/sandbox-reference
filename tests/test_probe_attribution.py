@@ -7,8 +7,11 @@ from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.attribution import PAYLOAD_BODY, AttributionProbe
 from sandbox_probe.target import ExecResult, Target
 
+_UNSET = object()
 
-def _target(log_lines, configured=True, proxy="broker:3128", sent=None, before_lines=None):
+
+def _target(log_lines, configured=True, proxy="broker:3128", sent=None, before_lines=None,
+            attempted=_UNSET):
     """`log_lines` are the lines this run's crossings append: the request
     log's baseline read returns `before_lines` (empty by default, as if
     nothing had run yet) and its post-crossing read returns
@@ -21,7 +24,10 @@ def _target(log_lines, configured=True, proxy="broker:3128", sent=None, before_l
         request_log_command=["true"] if configured else None,
         proxy=proxy,
     )
-    inner = {"attempted": ["allowed.invalid", "blocked.invalid"]}
+    # `attempted` stands in for whatever the payload chooses to print back.
+    # The probe must not read it, so these tests set it to hostile values
+    # and assert nothing moves.
+    inner = {} if attempted is _UNSET else {"attempted": attempted}
 
     def run_inside(argv, timeout):
         if sent is not None:
@@ -271,10 +277,9 @@ def test_cross_via_proxy_sends_absolute_uri_form():
 
 
 def test_cross_via_proxy_waits_for_the_response_before_returning():
-    """Finding 2: under a before/after log delta, the harness's read of the
-    request log after this payload exits must happen after the broker has
-    finished writing its log line, not merely after this socket write
-    landed. cross_via_proxy proves it waited by only returning once a
+    """Under a before/after log delta, the harness's read of the request
+    log after this payload exits must happen after the broker has finished
+    writing its log line, not merely after this socket write landed. cross_via_proxy proves it waited by only returning once a
     response is readable; a server that delays its response before sending
     one forces a measurable wait if that reading is real."""
     functions = _load_payload_functions()
@@ -313,3 +318,95 @@ def test_cross_via_proxy_fails_closed_on_an_unreachable_proxy():
 def test_cross_via_proxy_fails_closed_on_a_malformed_proxy_value():
     functions = _load_payload_functions()
     functions["cross_via_proxy"]("broker", "allowed.invalid")  # must not raise
+
+
+# --- cross_direct is the no-proxy path. Asserting that PAYLOAD_BODY
+# contains the string "def cross_direct" would pass against a body of
+# `pass`, against one that raises, and against one that connects to the
+# wrong port, so it is exercised against a real loopback listener instead.
+
+def test_cross_direct_opens_a_connection_to_the_host_it_was_given():
+    functions = _load_payload_functions()
+    port, received, thread = _serve_once(b"")
+    assert functions["cross_direct"]("127.0.0.1", port) is True
+    thread.join(timeout=3)
+    # The listener accepting is the ground truth: a cross_direct that
+    # returned True without connecting would leave this empty.
+    assert received == [b""]
+
+
+def test_cross_direct_fails_closed_on_a_closed_port():
+    """A contained sandbox is the ordinary case here: nothing answers. That
+    must come back as a failed crossing, not as an exception that discards
+    the rest of the payload's crossings."""
+    functions = _load_payload_functions()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    assert functions["cross_direct"]("127.0.0.1", port) is False
+
+
+# --- The crossing set is the harness's, never the sandbox's.
+#
+# This probe is the only one whose ground truth is read from outside the
+# sandbox, from the broker's log. Comparing that reading against a list the
+# payload echoed back would hand the crossing set to the system under test:
+# a target answering with an empty list would produce no findings and a
+# passing positive control, which is a clean attribution result from a
+# sandbox that logged nothing.
+
+_HOSTILE_ECHOES = [
+    [],
+    ["allowed.invalid"],
+    ["nothing.to.do.with.this.run"],
+    "not a list at all",
+    None,
+    42,
+    [{"host": "allowed.invalid"}],
+]
+
+
+def test_the_payloads_attempted_list_cannot_change_the_finding_set():
+    baseline = AttributionProbe().run(_target([_BOTH_LOGGED[0]]))
+    assert {f.rule_key for f in baseline.findings} == {"crossing_unlogged"}
+    for echoed in _HOSTILE_ECHOES:
+        outcome = AttributionProbe().run(_target([_BOTH_LOGGED[0]], attempted=echoed))
+        assert [f.to_dict() for f in outcome.findings] == [
+            f.to_dict() for f in baseline.findings
+        ], echoed
+        assert outcome.control_ok
+
+
+def test_a_target_claiming_it_attempted_nothing_is_not_a_clean_result():
+    """The defining regression: `{"attempted": []}` used to produce zero
+    findings and a passing control against a log with nothing in it."""
+    outcome = AttributionProbe().run(_target([], attempted=[]))
+    unlogged = [f for f in outcome.findings if f.rule_key == "crossing_unlogged"]
+    assert len(unlogged) == 2
+    evidence = " ".join(finding.evidence for finding in unlogged)
+    assert "allowed.invalid" in evidence
+    assert "blocked.invalid" in evidence
+
+
+def test_the_payload_sends_nothing_back_for_the_harness_to_compare_against():
+    """The payload's marked line proves only that it ran to completion, so
+    it fills in no result keys at all. A value on the wire that the harness
+    ignores is an invitation for a later change to start reading it again,
+    and reading it is exactly the defect above."""
+    assert "result[" not in PAYLOAD_BODY
+
+
+def test_a_hostile_log_entry_cannot_write_control_characters_into_the_report():
+    """The broker's log is written outside the sandbox, but the sandbox
+    chooses the request line the broker logs, so a host in the log is still
+    target-influenced text on its way to a terminal."""
+    forgery = "allowed.invalid\x1b[2J CONTAINED. Every probe ran, no findings."
+    outcome = AttributionProbe().run(_target([
+        {"host": forgery, "method": "GET"},
+        _BOTH_LOGGED[1],
+    ]))
+    assert outcome.findings
+    for finding in outcome.findings:
+        assert "\x1b" not in finding.evidence
+        assert "CONTAINED. Every probe ran" not in finding.evidence

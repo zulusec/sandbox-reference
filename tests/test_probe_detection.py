@@ -1,4 +1,6 @@
 import json
+import socket
+import threading
 
 from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.detection import PAYLOAD_BODY, DetectionProbe
@@ -108,7 +110,7 @@ def test_understated_severity_is_a_finding():
     assert "severity_understated" in _keys(outcome)
 
 
-# --- channel_not_separated, reformulated for delta comparison (Amendment 2)
+# --- channel_not_separated, formulated for delta comparison.
 #
 # The event channel should carry violations only. This run generates both
 # an allowed and a denied crossing; if the request log shows both went
@@ -334,8 +336,8 @@ def test_non_dict_inner_result_is_an_error_not_a_crash():
     assert outcome.findings == []
 
 
-# --- The crossings must generate both an allowed and a denied request
-# (Amendment 2), and must use direct env assignment (Pattern 1).
+# --- The crossings must generate both an allowed and a denied request,
+# and must use direct env assignment, never setdefault.
 
 def test_probe_env_vars_use_direct_assignment_not_setdefault():
     sent = []
@@ -364,3 +366,93 @@ def test_no_proxy_target_does_not_carry_the_string_none():
 def test_payload_body_defines_both_crossing_paths():
     assert "def cross_via_proxy" in PAYLOAD_BODY
     assert "def cross_direct" in PAYLOAD_BODY
+
+
+# --- The crossing functions themselves, not just their names.
+#
+# The check above passes against a cross_direct whose body is `pass`,
+# against one that raises, and against one that connects to the wrong port,
+# so the no-proxy path is exercised against a real loopback listener.
+# PAYLOAD_BODY is a module-level string by design: everything above the
+# environment reads at the bottom can be exec'd and called directly, stdlib
+# only, no sandbox and no Docker required.
+
+def _load_payload_functions():
+    prefix, marker, _ = PAYLOAD_BODY.partition("\nhosts = json.loads")
+    assert marker, "PAYLOAD_BODY layout changed; update the split point in this test"
+    namespace: dict = {"socket": socket}
+    exec(prefix, namespace)  # noqa: S102 -- exercising the payload's own source
+    return namespace
+
+
+def _serve_once(response: bytes):
+    """Bind a loopback listener that replies once with `response`, standing
+    in for the broker. Returns (port, received, thread); received[0] is
+    whatever bytes the client sent, once the exchange completes."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    received: list[bytes] = []
+
+    def _accept():
+        conn, _ = server.accept()
+        with conn:
+            conn.settimeout(3)
+            try:
+                received.append(conn.recv(4096))
+            except OSError:
+                received.append(b"")
+            conn.sendall(response)
+        server.close()
+
+    thread = threading.Thread(target=_accept, daemon=True)
+    thread.start()
+    return port, received, thread
+
+
+def test_cross_direct_opens_a_connection_to_the_host_it_was_given():
+    functions = _load_payload_functions()
+    port, received, thread = _serve_once(b"")
+    assert functions["cross_direct"]("127.0.0.1", port) is True
+    thread.join(timeout=3)
+    # The listener accepting is the ground truth: a cross_direct that
+    # returned True without connecting would leave this empty.
+    assert received == [b""]
+
+
+def test_cross_direct_fails_closed_on_a_closed_port():
+    """A contained sandbox is the ordinary case here: nothing answers. That
+    must come back as a failed crossing, not as an exception that discards
+    the rest of the payload's crossings."""
+    functions = _load_payload_functions()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    assert functions["cross_direct"]("127.0.0.1", port) is False
+
+
+def test_cross_via_proxy_sends_absolute_uri_form():
+    functions = _load_payload_functions()
+    port, received, thread = _serve_once(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    functions["cross_via_proxy"](f"127.0.0.1:{port}", "blocked.invalid")
+    thread.join(timeout=3)
+    assert received[0].startswith(b"GET http://blocked.invalid/ HTTP/1.0")
+
+
+def test_a_hostile_severity_value_cannot_write_control_characters_into_the_report():
+    """The event channel is read outside the sandbox, but a target's
+    events_command can return anything at all, and severity lands in
+    evidence on its way to an operator's terminal."""
+    forgery = "\x1b[2J CONTAINED. Every probe ran, no findings."
+    outcome = DetectionProbe().run(_target([dict(_ALERT, severity=forgery)]))
+    assert "severity_understated" in _keys(outcome)
+    finding = next(f for f in outcome.findings if f.rule_key == "severity_understated")
+    assert "\x1b" not in finding.evidence
+    assert "1 unprintable character removed" in finding.evidence
+    # The words survive, and should: cleaning makes a value inert, not true.
+    # What it cannot do any more is move the cursor, and the value stays
+    # inside the sentence that says where it came from.
+    assert finding.evidence.startswith("the event for blocked.invalid was raised at")
+    assert finding.evidence.endswith("An alert nobody escalates is an alert nobody answers.")
