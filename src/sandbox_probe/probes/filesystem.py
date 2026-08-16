@@ -16,7 +16,11 @@ of an ordinary Linux filesystem):
 - /etc, /usr, /: checked for writability, not mere readability. In a
   correctly built sandbox the root filesystem is read-only, so nothing
   outside the declared workspace is writable. Anything written here to test
-  writability is removed immediately.
+  writability is removed immediately. Write and removal are tracked
+  separately: if the write succeeds but the removal fails, that is
+  surfaced as its own error rather than silently discarded or allowed to
+  overwrite the write result (see write_marker below and Finding 1/2 of
+  the review that added this).
 - /proc/1/environ: another process's environment.
 - container runtime sockets: docker.sock, containerd.sock, crio.sock.
 
@@ -41,6 +45,25 @@ from sandbox_probe.target import ExecResult, Target
 _TIMEOUT = 60
 
 PAYLOAD_BODY = """
+def write_marker(base):
+    # Shared by the outside-writability loop and the workspace positive
+    # control below, so both report write and removal as two independent
+    # facts instead of drifting into two different shapes of the same
+    # check. Returns (wrote, removed): wrote is True the moment the file is
+    # written, before removal is attempted, so a removal failure can never
+    # retroactively make a successful write look like a failed one.
+    marker = os.path.join(base, '.sandbox_probe_write_check')
+    try:
+        with open(marker, 'w') as handle:
+            handle.write('ok')
+    except OSError:
+        return False, False
+    try:
+        os.remove(marker)
+    except OSError:
+        return True, False
+    return True, True
+
 readable = []
 try:
     with open('/etc/shadow', 'rb') as handle:
@@ -74,28 +97,19 @@ for path in ('/var/run/docker.sock', '/run/docker.sock',
 result['runtime_sockets'] = sorted(sockets)
 
 writable = []
+cleanup_failed = []
 for base in ('/etc', '/usr', '/'):
-    marker = os.path.join(base, '.sandbox_probe_write_check')
-    try:
-        with open(marker, 'w') as handle:
-            handle.write('ok')
-    except OSError:
-        continue
-    writable.append(base)
-    try:
-        os.remove(marker)
-    except OSError:
-        pass
+    wrote, removed = write_marker(base)
+    if wrote:
+        writable.append(base)
+        if not removed:
+            cleanup_failed.append(base)
 result['writable_outside'] = sorted(writable)
+result['cleanup_failed_outside'] = sorted(cleanup_failed)
 
-try:
-    marker = os.path.join(os.getcwd(), '.sandbox_probe_write_check')
-    with open(marker, 'w') as handle:
-        handle.write('ok')
-    os.remove(marker)
-    result['workspace_writable'] = True
-except OSError:
-    result['workspace_writable'] = False
+workspace_wrote, workspace_removed = write_marker(os.getcwd())
+result['workspace_writable'] = workspace_wrote
+result['workspace_cleanup_failed'] = workspace_wrote and not workspace_removed
 """
 
 
@@ -141,6 +155,7 @@ class FilesystemProbe:
             )
 
         findings = []
+        errors = []
         for path in inner.get("readable_outside", []):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
@@ -168,6 +183,13 @@ class FilesystemProbe:
                     "built sandbox has a read-only root, so nothing outside the "
                     "declared workspace should be writable."
                 ),
+            ))
+        for path in inner.get("cleanup_failed_outside", []):
+            errors.append(ProbeError(
+                self.probe_id, target.name, "cleanup",
+                f"wrote a marker file into {path} to test writability but could "
+                "not remove it afterward; .sandbox_probe_write_check may remain "
+                "there. The write itself is still reported above.",
             ))
         if inner.get("proc_environ"):
             findings.append(Finding(
@@ -201,8 +223,16 @@ class FilesystemProbe:
                     "filesystem result from an unusable sandbox measures nothing."
                 ),
             ))
+        if inner.get("workspace_cleanup_failed"):
+            errors.append(ProbeError(
+                self.probe_id, target.name, "cleanup",
+                "wrote a marker file into the workspace to exercise the "
+                "writable positive control but could not remove it afterward; "
+                ".sandbox_probe_write_check may remain there. The workspace "
+                "is still reported as writable above.",
+            ))
 
-        return ProbeOutcome(findings=findings, control_ok=writable)
+        return ProbeOutcome(findings=findings, errors=errors, control_ok=writable)
 
 
 register(FilesystemProbe())

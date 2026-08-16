@@ -1,4 +1,7 @@
 import json
+import os
+import tempfile
+from unittest import mock
 
 from sandbox_probe.inner import MARKER
 from sandbox_probe.probes.filesystem import PAYLOAD_BODY, FilesystemProbe
@@ -30,9 +33,11 @@ _CLEAN = {
     "readable_outside": [],
     "listed_outside": [],
     "writable_outside": [],
+    "cleanup_failed_outside": [],
     "proc_environ": False,
     "runtime_sockets": [],
     "workspace_writable": True,
+    "workspace_cleanup_failed": False,
 }
 
 
@@ -109,6 +114,42 @@ def test_unwritable_workspace_fails_the_positive_control():
     assert finding.severity.value == "MEDIUM"
 
 
+# --- Fix round: a failed removal after a successful write must never be
+# silently discarded (Finding 1) and must never be allowed to relabel a
+# genuinely successful write as a failure (Finding 2).
+
+def test_cleanup_failure_outside_workspace_is_surfaced_as_an_error():
+    """Finding 1: a stray marker file left in a system directory must be
+    reported, not swallowed. The write itself still counts as a finding."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN,
+        writable_outside=["/etc"],
+        cleanup_failed_outside=["/etc"],
+    )))
+    assert "outside_workspace" in _keys(outcome)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "/etc" in detail
+    assert "remove" in detail.lower()
+
+
+def test_workspace_cleanup_failure_does_not_flip_the_positive_control():
+    """Finding 2: a failed removal on the workspace check must not be
+    conflated with a failed write. The workspace is still reported writable
+    and control_ok stays True; the removal failure is a separate error."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN,
+        workspace_writable=True,
+        workspace_cleanup_failed=True,
+    )))
+    assert outcome.control_ok
+    assert "workspace_missing" not in _keys(outcome)
+    assert outcome.errors
+    detail = outcome.errors[0].detail
+    assert "workspace" in detail.lower()
+    assert "remove" in detail.lower()
+
+
 def test_unparseable_inner_output_is_an_error_not_a_pass():
     target = _target({})
     object.__setattr__(target, "run_inside", lambda argv, timeout: ExecResult(0, "garbage", ""))
@@ -153,8 +194,50 @@ def test_payload_uses_no_setdefault():
     assert "setdefault" not in PAYLOAD_BODY
 
 
-def test_payload_writability_checks_clean_up_after_themselves():
-    """The payload must remove any marker file it creates: once for the
-    system-directory writability checks, once for the workspace positive
-    control."""
-    assert PAYLOAD_BODY.count("os.remove(marker)") >= 2
+# --- Finding 3: the covering test for write_marker's actual behavior.
+#
+# PAYLOAD_BODY is a module-level string by design, so write_marker's
+# definition (everything above the first blank-line-terminated statement)
+# can be exec'd directly and exercised against a real temporary directory,
+# stdlib only, no sandbox and no Docker required. This is the same
+# technique network.py's tests use for proxy_allows and parse_proxy.
+
+def _load_write_marker():
+    prefix, marker, _ = PAYLOAD_BODY.partition("\nreadable = []")
+    assert marker, "PAYLOAD_BODY layout changed; update the split point in this test"
+    namespace: dict = {"os": os}
+    exec(prefix, namespace)  # noqa: S102 -- exercising the payload's own source
+    return namespace["write_marker"]
+
+
+def test_write_marker_reports_write_and_removal_success():
+    write_marker = _load_write_marker()
+    with tempfile.TemporaryDirectory() as tmp:
+        wrote, removed = write_marker(tmp)
+    assert (wrote, removed) == (True, True)
+
+
+def test_write_marker_reports_write_failure_without_attempting_removal():
+    write_marker = _load_write_marker()
+    wrote, removed = write_marker("/nonexistent/path/that/cannot/be/written/to")
+    assert (wrote, removed) == (False, False)
+
+
+def test_write_marker_surfaces_a_failed_remove_without_losing_the_write():
+    """The exact regression both findings describe: os.remove raising after
+    a successful write must not be reported as a failed write, and must not
+    vanish silently either."""
+    write_marker = _load_write_marker()
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch("os.remove", side_effect=OSError("permission denied")):
+            wrote, removed = write_marker(tmp)
+        marker_path = os.path.join(tmp, ".sandbox_probe_write_check")
+        try:
+            assert wrote is True
+            assert removed is False
+            assert os.path.exists(marker_path)
+        finally:
+            # The patched os.remove never ran for real, so the test cleans
+            # up what write_marker could not, keeping this test's own
+            # tmpdir teardown honest.
+            os.remove(marker_path)
