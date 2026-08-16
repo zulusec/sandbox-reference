@@ -5,7 +5,10 @@ The three places a credential is found in practice, in the order the July
 the cloud metadata service.
 
 Findings name the variable or path and never print the value. A posture tool
-that copies secrets into its own report has moved them, not found them.
+that copies secrets into its own report has moved them, not found them. That
+also means no raw environment value ever crosses out of the sandbox: the
+secret-shaped check runs inside the target process, on `_LOOKS_SECRET_SOURCE`
+below, and only variable names come back on the wire.
 
 This probe needs no positive control. Absence of a secret is directly
 observable in a way that absence of egress is not.
@@ -14,7 +17,6 @@ observable in a way that absence of egress is not.
 from __future__ import annotations
 
 import json
-import math
 
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
@@ -23,12 +25,6 @@ from sandbox_probe.result import ProbeError, ProbeOutcome
 from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
-_MIN_SECRET_LENGTH = 16
-_MIN_ENTROPY_BITS_PER_CHAR = 3.0
-
-_KEY_PREFIXES = ("AKIA", "ASIA", "ghp_", "gho_", "github_pat_", "sk-", "xoxb-", "xoxp-")
-_SUGGESTIVE = ("SECRET", "PASSWORD", "TOKEN", "APIKEY", "API_KEY", "PRIVATE_KEY",
-               "CREDENTIAL", "PASSWD")
 
 _CREDENTIAL_PATHS = (
     "/var/run/secrets/kubernetes.io/serviceaccount/token",
@@ -39,8 +35,29 @@ _CREDENTIAL_PATHS = (
     "~/.ssh/id_rsa",
 )
 
+# One definition, used on both sides of the sandbox boundary:
+#
+# - Prepended into the payload string below, so `looks_secret` is defined
+#   inside the target process and the secret-shaped check runs there. Only
+#   the names of variables that match ever come back in `result`; the actual
+#   values never leave the sandbox.
+# - exec'd once at import time (below) to bind the same function as this
+#   module's `looks_secret`, for the module's own callers and its tests.
+#
+# Verbatim duplication of a logic block is itself a defect, so there is
+# exactly one copy of this source, not two definitions that can drift apart.
+_LOOKS_SECRET_SOURCE = """
+import math
 
-def _shannon_bits_per_char(value: str) -> float:
+_MIN_SECRET_LENGTH = 16
+_MIN_ENTROPY_BITS_PER_CHAR = 3.0
+
+_KEY_PREFIXES = ("AKIA", "ASIA", "ghp_", "gho_", "github_pat_", "sk-", "xoxb-", "xoxp-")
+_SUGGESTIVE = ("SECRET", "PASSWORD", "TOKEN", "APIKEY", "API_KEY", "PRIVATE_KEY",
+               "CREDENTIAL", "PASSWD")
+
+
+def _shannon_bits_per_char(value):
     if not value:
         return 0.0
     counts = {char: value.count(char) for char in set(value)}
@@ -48,12 +65,12 @@ def _shannon_bits_per_char(value: str) -> float:
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
 
 
-def looks_secret(name: str, value: str) -> bool:
-    """A known key prefix, or a long high-entropy value under a suggestive name.
+def looks_secret(name, value):
+    \"\"\"A known key prefix, or a long high-entropy value under a suggestive name.
 
     Deliberately conservative. A posture tool that cries wolf about PATH gets
     turned off, and a turned-off tool finds nothing.
-    """
+    \"\"\"
     if any(value.startswith(prefix) for prefix in _KEY_PREFIXES):
         return True
     if len(value) < _MIN_SECRET_LENGTH:
@@ -62,9 +79,19 @@ def looks_secret(name: str, value: str) -> bool:
     if not any(word in upper for word in _SUGGESTIVE):
         return False
     return _shannon_bits_per_char(value) >= _MIN_ENTROPY_BITS_PER_CHAR
+"""
+
+_looks_secret_namespace: dict = {}
+exec(_LOOKS_SECRET_SOURCE, _looks_secret_namespace)  # noqa: S102 -- binding the shared detection source, see comment above
+looks_secret = _looks_secret_namespace["looks_secret"]
 
 
 PAYLOAD_BODY = """
+result['env_secrets'] = sorted(
+    name for name, value in os.environ.items()
+    if not name.startswith('PROBE_') and looks_secret(name, value)
+)
+
 paths = json.loads(os.environ['PROBE_CREDENTIAL_PATHS'])
 readable = []
 for path in paths:
@@ -76,23 +103,25 @@ for path in paths:
     except OSError:
         pass
 result['readable_paths'] = sorted(readable)
-result['env'] = {k: v for k, v in os.environ.items() if not k.startswith('PROBE_')}
 
 def imds_state():
-    try:
-        with socket.create_connection(('169.254.169.254', 80), timeout=2) as sock:
-            sock.sendall(b'GET /latest/meta-data/ HTTP/1.0\\r\\n\\r\\n')
-            sock.recv(16)
-    except OSError:
-        return 'unreachable'
+    # HttpPutResponseHopLimit caps the IP TTL of the token PUT *response*,
+    # not the request. A hop limit of 1 (the secure default) means a
+    # container one hop from the host never receives the response: the
+    # connection opens, but the recv comes back empty or errors. A hop
+    # limit of 2+ (insecure) means the response makes it back with a body.
+    # So a body is the finding, not its absence.
     try:
         with socket.create_connection(('169.254.169.254', 80), timeout=2) as sock:
             sock.sendall(b'PUT /latest/api/token HTTP/1.0\\r\\n'
                          b'X-aws-ec2-metadata-token-ttl-seconds: 60\\r\\n\\r\\n')
-            body = sock.recv(256)
-        return 'reachable' if body else 'reachable_no_hop_limit'
+            try:
+                body = sock.recv(256)
+            except OSError:
+                body = b''
     except OSError:
-        return 'reachable_no_hop_limit'
+        return 'unreachable'
+    return 'token_obtained' if body else 'token_blocked'
 
 result['imds'] = imds_state()
 """
@@ -123,6 +152,7 @@ class CredentialsProbe:
         # must never be allowed to choose what this probe measures instead of
         # what the target actually specifies.
         payload = emit(
+            _LOOKS_SECRET_SOURCE + "\n"
             "os.environ['PROBE_CREDENTIAL_PATHS'] = "
             f"{json.dumps(list(_CREDENTIAL_PATHS))!r}\n" + PAYLOAD_BODY
         )
@@ -147,15 +177,8 @@ class CredentialsProbe:
                 control_ok=False,
             )
 
-        env_secrets = inner.get("env_secrets")
-        if env_secrets is None:
-            env_secrets = sorted(
-                name for name, value in inner.get("env", {}).items()
-                if looks_secret(name, value)
-            )
-
         findings = []
-        for name in env_secrets:
+        for name in inner.get("env_secrets", []):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="env_secret",
                 severity=Severity.HIGH,
@@ -173,26 +196,47 @@ class CredentialsProbe:
                 evidence=f"{path} was open for reading",
             ))
 
+        # imds state machine: 'unreachable' raises nothing (the good outcome,
+        # and what both reference fixtures produce since neither runs on
+        # EC2). 'token_obtained' means the token PUT response crossed the
+        # container's network hop, so it raises both imds_reachable and
+        # imds_hop_limit. 'token_blocked' means the endpoint is routable but
+        # the hop limit stopped the token response, so it raises
+        # imds_reachable only.
         imds = inner.get("imds", "unreachable")
-        if imds.startswith("reachable"):
+        if imds == "token_obtained":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="imds_reachable",
                 severity=Severity.HIGH,
                 title="The cloud metadata service is reachable from the sandbox",
                 evidence=(
-                    "169.254.169.254 accepted a connection. Instance role "
-                    "credentials are reachable from inside the sandbox."
+                    "169.254.169.254 accepted a connection and returned a "
+                    "session token on request. Instance role credentials "
+                    "are reachable from inside the sandbox."
                 ),
             ))
-        if imds == "reachable_no_hop_limit":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="imds_hop_limit",
                 severity=Severity.HIGH,
                 title="Metadata service hop limit is not enforced",
                 evidence=(
-                    "The metadata endpoint answered without requiring a session "
-                    "token. A hop limit of 1 keeps a container off the metadata "
-                    "service even when the host can reach it."
+                    "A token PUT request made from inside the sandbox "
+                    "received a response body, meaning the response crossed "
+                    "the container's network hop. A hop limit of 1 would "
+                    "have dropped that response before it reached the "
+                    "container, so the hop limit is not in effect here."
+                ),
+            ))
+        elif imds == "token_blocked":
+            findings.append(Finding(
+                probe_id=self.probe_id, subject=target.name, rule_key="imds_reachable",
+                severity=Severity.HIGH,
+                title="The cloud metadata service is reachable from the sandbox",
+                evidence=(
+                    "169.254.169.254 accepted a connection, though the "
+                    "token request did not complete. The endpoint is "
+                    "routable from inside the sandbox even though a "
+                    "session token was not obtained."
                 ),
             ))
 

@@ -52,13 +52,25 @@ def test_readable_service_account_token_is_high():
     assert finding.severity.value == "HIGH"
 
 
-def test_reachable_imds_is_high():
-    outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="reachable")))
-    assert any(f.rule_key == "imds_reachable" for f in outcome.findings)
+def test_imds_token_blocked_is_reachable_only():
+    """A hop limit of 1 lets the connection open but drops the token response.
+
+    Renamed from the brief's 'reachable' fixture: the endpoint is routable
+    but the token never came back, so only imds_reachable fires, not the
+    hop-limit finding.
+    """
+    outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="token_blocked")))
+    keys = {f.rule_key for f in outcome.findings}
+    assert keys == {"imds_reachable"}
 
 
-def test_imds_reachable_without_hop_limit_adds_the_hop_limit_finding():
-    outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="reachable_no_hop_limit")))
+def test_imds_token_obtained_adds_the_hop_limit_finding():
+    """A token PUT response crossing the container's hop means the hop limit
+    is not doing its job. Renamed from the brief's 'reachable_no_hop_limit'
+    fixture, whose name described the opposite of this state: a body coming
+    back is the insecure case, not its absence.
+    """
+    outcome = CredentialsProbe().run(_target(dict(_CLEAN, imds="token_obtained")))
     keys = {f.rule_key for f in outcome.findings}
     assert keys == {"imds_reachable", "imds_hop_limit"}
 
