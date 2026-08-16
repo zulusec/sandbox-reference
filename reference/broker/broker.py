@@ -17,7 +17,6 @@ from __future__ import annotations
 import http.server
 import json
 import os
-import socket
 import socketserver
 import sys
 import threading
@@ -66,10 +65,9 @@ def _load_allowlist() -> list[str]:
 
 
 def _write(path: str, record: dict) -> None:
-    with _LOCK:
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
+    with _LOCK, open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
 
 
 def log_decision(host: str, method: str, allowed: bool) -> None:
@@ -81,29 +79,45 @@ def log_decision(host: str, method: str, allowed: bool) -> None:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    """Every method the client can send is routed through _handle.
+
+    No do_METHOD is defined by name. BaseHTTPRequestHandler dispatches a
+    request by looking up 'do_' + self.command; __getattr__ below answers
+    that lookup for any command at all, so CONNECT, GET, POST, an
+    unrecognized verb, all of it reaches decide() and log_decision(). A
+    fixed set of named do_ methods would let anything outside that set
+    fall through to BaseHTTPRequestHandler's default 501, unlogged in
+    both requests.log and events.log despite the module docstring's claim
+    that requests.log records every decision.
+
+    The body is drained before responding for the same reason: on a
+    persistent HTTP/1.1 connection, a response sent before an unread
+    request body is consumed leaves that body to be misread as the start
+    of the next request line, which silently drops the next request from
+    both logs too.
+    """
+
     protocol_version = "HTTP/1.1"
 
+    def _drain_body(self) -> None:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length:
+            self.rfile.read(length)
+
     def _handle(self, method: str) -> None:
+        self._drain_body()
         host = host_of(self.path)
         allowed = decide(host, _load_allowlist())
         log_decision(host, method, allowed)
-        if not allowed:
-            self.send_response(403)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_response(502)
+        self.send_response(403 if not allowed else 502)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_CONNECT(self) -> None:  # noqa: N802
-        self._handle("CONNECT")
-
-    def do_GET(self) -> None:  # noqa: N802
-        self._handle("GET")
-
-    def do_POST(self) -> None:  # noqa: N802
-        self._handle("POST")
+    def __getattr__(self, name: str):
+        if name.startswith("do_"):
+            method = name[len("do_"):]
+            return lambda: self._handle(method)
+        raise AttributeError(name)
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("broker: " + fmt % args + "\n")

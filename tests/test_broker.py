@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "reference" / "broker"))
 
-from broker import decide, host_of  # noqa: E402
+from broker import decide, host_of
 
 _ALLOWLIST = ["example.invalid", "*.pypi.invalid"]
 
