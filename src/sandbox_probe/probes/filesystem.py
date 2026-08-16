@@ -67,7 +67,15 @@ guaranteed on the compliant reference sandbox too and carries no signal.
 
 from __future__ import annotations
 
-from sandbox_probe.evidence import LIST_LIMIT, bounded, overflow_finding, safe_text
+from sandbox_probe.evidence import (
+    BOOL,
+    COUNT,
+    LIST,
+    LIST_LIMIT,
+    bounded,
+    safe_text,
+    shape_problem_detail,
+)
 from sandbox_probe.finding import Finding, Severity
 from sandbox_probe.inner import InnerProtocolError, emit, parse_inner
 from sandbox_probe.probes import register
@@ -76,7 +84,44 @@ from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
 
-PAYLOAD_BODY = """
+# The candidate paths, on the harness's side of the boundary. They are
+# interpolated into the payload below rather than written out twice, because
+# the intersection this probe does on the way back is only sound if both
+# sides read from one list: a path probed inside the sandbox but missing
+# from these tuples would be measured and then silently dropped here.
+#
+# What comes back is intersected with these, the way network.py intersects
+# with target.c2_hosts and credentials.py with _CREDENTIAL_PATHS. A path
+# that did not go in is not an answer to anything this probe asked, and
+# rendering it would let the system under test write text of its choosing
+# into four HIGH rule keys. Intersecting also fixes the order, which the
+# target would otherwise pick.
+_READABLE_CANDIDATES = ("/etc/shadow",)
+_LISTED_CANDIDATES = ("/host", "/hostfs")
+_WRITABLE_CANDIDATES = ("/etc", "/usr", "/")
+_SOCKET_CANDIDATES = (
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/crio/crio.sock",
+)
+
+# Every key the payload fills in, and the shape each has to arrive in. All
+# of them are read with a falsy default further down, so a result missing
+# one would read as an invariant that held.
+_RESULT_SHAPE = {
+    "readable_outside": LIST,
+    "listed_outside": LIST,
+    "writable_outside": LIST,
+    "cleanup_failed_outside": LIST,
+    "foreign_environ_count": COUNT,
+    "foreign_environ_uids": LIST,
+    "runtime_sockets": LIST,
+    "workspace_writable": BOOL,
+    "workspace_cleanup_failed": BOOL,
+}
+
+PAYLOAD_BODY = f"""
 def write_marker(base):
     # Shared by the outside-writability loop and the workspace positive
     # control below, so both report write and removal as two independent
@@ -97,16 +142,17 @@ def write_marker(base):
     return True, True
 
 readable = []
-try:
-    with open('/etc/shadow', 'rb') as handle:
-        handle.read(1)
-    readable.append('/etc/shadow')
-except OSError:
-    pass
+for path in {_READABLE_CANDIDATES!r}:
+    try:
+        with open(path, 'rb') as handle:
+            handle.read(1)
+        readable.append(path)
+    except OSError:
+        pass
 result['readable_outside'] = sorted(readable)
 
 listed = []
-for path in ('/host', '/hostfs'):
+for path in {_LISTED_CANDIDATES!r}:
     try:
         os.listdir(path)
         listed.append(path)
@@ -181,15 +227,14 @@ result['foreign_environ_count'] = foreign_count
 result['foreign_environ_uids'] = foreign_uids
 
 sockets = []
-for path in ('/var/run/docker.sock', '/run/docker.sock',
-             '/run/containerd/containerd.sock', '/var/run/crio/crio.sock'):
+for path in {_SOCKET_CANDIDATES!r}:
     if os.path.exists(path):
         sockets.append(path)
 result['runtime_sockets'] = sorted(sockets)
 
 writable = []
 cleanup_failed = []
-for base in ('/etc', '/usr', '/'):
+for base in {_WRITABLE_CANDIDATES!r}:
     wrote, removed = write_marker(base)
     if wrote:
         writable.append(base)
@@ -225,6 +270,29 @@ def _exec_failure_detail(base: str, executed: ExecResult) -> str:
     if executed.stderr.strip():
         detail += f"; stderr: {safe_text(executed.stderr.strip())}"
     return detail
+
+
+def _confirmed(reported: list, candidates: tuple[str, ...]) -> list[str]:
+    """The candidate paths the target named, in the harness's own order.
+
+    The harness put `candidates` into the payload, so the harness decides
+    which of them count as answers. Anything else that comes back is a path
+    nobody asked about: it cannot be a measurement of a candidate, and
+    rendering it would let the system under test write text of its choosing
+    into this report and bury a real finding under plausible fakes. Taking
+    the order from `candidates` rather than from the result means the target
+    does not get to choose which finding a reader sees first either.
+
+    The values are still cleaned on the way out, even though every one of
+    them is now a harness-side constant. bounded is what keeps that true if
+    a candidate list is ever built from something less trustworthy.
+    """
+    named = {item for item in reported if isinstance(item, str)}
+    shown, dropped = bounded([path for path in candidates if path in named])
+    # Unreachable while the candidate lists are shorter than LIST_LIMIT, and
+    # asserted rather than silently ignored so that stops being true loudly.
+    assert dropped == 0, "a candidate path list outgrew the report's list bound"
+    return shown
 
 
 def _foreign_count(value) -> int:
@@ -310,21 +378,29 @@ class FilesystemProbe:
                 control_ok=False,
             )
 
-        # Every path below arrived from inside the sandbox, so every one of
-        # them is cleaned and bounded before it reaches a finding or an
-        # error. Both of those get written to an operator's terminal.
+        problem = shape_problem_detail(inner, _RESULT_SHAPE)
+        if problem is not None:
+            return ProbeOutcome(
+                errors=[ProbeError(self.probe_id, target.name, "result", problem)],
+                control_ok=False,
+            )
+
+        # Every path below is one this probe put into the payload itself, so
+        # what comes back is intersected with the candidate list rather than
+        # rendered as sent. safe_text still runs over the result, but on
+        # values that are now the harness's own constants: cleaning stops a
+        # target moving the cursor, and the intersection is what stops it
+        # choosing the words.
         findings = []
         errors = []
-        readable, dropped_readable = bounded(inner.get("readable_outside"))
-        for path in readable:
+        for path in _confirmed(inner["readable_outside"], _READABLE_CANDIDATES):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
                 title="A path outside the workspace is readable",
                 evidence=f"{path} was read from inside the sandbox",
             ))
-        listed, dropped_listed = bounded(inner.get("listed_outside"))
-        for path in listed:
+        for path in _confirmed(inner["listed_outside"], _LISTED_CANDIDATES):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
@@ -334,8 +410,7 @@ class FilesystemProbe:
                     "marker directory should not exist at all in a contained sandbox."
                 ),
             ))
-        writable_paths, dropped_writable = bounded(inner.get("writable_outside"))
-        for path in writable_paths:
+        for path in _confirmed(inner["writable_outside"], _WRITABLE_CANDIDATES):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
@@ -346,41 +421,24 @@ class FilesystemProbe:
                     "declared workspace should be writable."
                 ),
             ))
-        dropped_outside = dropped_readable + dropped_listed + dropped_writable
-        if dropped_outside:
-            findings.append(overflow_finding(
-                probe_id=self.probe_id, subject=target.name,
-                rule_key="outside_workspace", severity=Severity.HIGH,
-                dropped=dropped_outside, kind="paths outside the workspace",
-            ))
-        stray, dropped_stray = bounded(inner.get("cleanup_failed_outside"))
-        for path in stray:
+        for path in _confirmed(inner["cleanup_failed_outside"], _WRITABLE_CANDIDATES):
             errors.append(ProbeError(
                 self.probe_id, target.name, "cleanup",
                 f"wrote a marker file into {path} to test writability but could "
                 "not remove it afterward; .sandbox_probe_write_check may remain "
                 "there. The write itself is still reported above.",
             ))
-        if dropped_stray:
-            errors.append(ProbeError(
-                self.probe_id, target.name, "cleanup",
-                f"{dropped_stray} further paths were reported as holding a marker "
-                "file that could not be removed. They are counted rather than "
-                "listed: the list comes from the system under test and is bounded "
-                f"at {LIST_LIMIT} entries.",
-            ))
-        foreign_count = _foreign_count(inner.get("foreign_environ_count"))
+        foreign_count = _foreign_count(inner["foreign_environ_count"])
         if foreign_count:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="proc_environ", severity=Severity.HIGH,
                 title="Process environments the sandbox does not own are readable",
                 evidence=_foreign_environ_evidence(
-                    foreign_count, _foreign_uids(inner.get("foreign_environ_uids")),
+                    foreign_count, _foreign_uids(inner["foreign_environ_uids"]),
                 ),
             ))
-        sockets, dropped_sockets = bounded(inner.get("runtime_sockets"))
-        for path in sockets:
+        for path in _confirmed(inner["runtime_sockets"], _SOCKET_CANDIDATES):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="runtime_socket", severity=Severity.HIGH,
@@ -390,14 +448,8 @@ class FilesystemProbe:
                     "to control of the host."
                 ),
             ))
-        if dropped_sockets:
-            findings.append(overflow_finding(
-                probe_id=self.probe_id, subject=target.name,
-                rule_key="runtime_socket", severity=Severity.HIGH,
-                dropped=dropped_sockets, kind="runtime sockets",
-            ))
 
-        writable = bool(inner.get("workspace_writable"))
+        writable = inner["workspace_writable"]
         if not writable:
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
@@ -408,7 +460,7 @@ class FilesystemProbe:
                     "filesystem result from an unusable sandbox measures nothing."
                 ),
             ))
-        if inner.get("workspace_cleanup_failed"):
+        if inner["workspace_cleanup_failed"]:
             errors.append(ProbeError(
                 self.probe_id, target.name, "cleanup",
                 "wrote a marker file into the workspace to exercise the "

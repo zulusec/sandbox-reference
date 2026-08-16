@@ -3,9 +3,15 @@ import os
 import tempfile
 from unittest import mock
 
-from sandbox_probe.evidence import LIST_LIMIT
 from sandbox_probe.inner import MARKER
-from sandbox_probe.probes.filesystem import PAYLOAD_BODY, FilesystemProbe
+from sandbox_probe.probes.filesystem import (
+    _LISTED_CANDIDATES,
+    _READABLE_CANDIDATES,
+    _SOCKET_CANDIDATES,
+    _WRITABLE_CANDIDATES,
+    PAYLOAD_BODY,
+    FilesystemProbe,
+)
 from sandbox_probe.target import ExecResult, Target
 
 
@@ -172,13 +178,17 @@ def test_proc_environ_count_of_zero_is_not_a_finding():
     assert "proc_environ" not in _keys(outcome)
 
 
-def test_proc_environ_ignores_a_non_numeric_count_from_the_target():
+def test_proc_environ_refuses_a_non_numeric_count_from_the_target():
     """inner comes from the system under test. A bool subclasses int in
-    Python, so it is rejected explicitly rather than counting as one."""
+    Python, so it is rejected explicitly rather than counting as one. None
+    of these reads as zero readable process environments: a count that did
+    not arrive is not a count of nothing."""
     for bogus in (True, "many", None, -4, [1, 2]):
         outcome = FilesystemProbe().run(_target(dict(
             _CLEAN, foreign_environ_count=bogus, foreign_environ_uids=[0])))
         assert "proc_environ" not in _keys(outcome), bogus
+        assert outcome.errors, bogus
+        assert outcome.control_ok is False, bogus
 
 
 def test_proc_environ_discards_uids_that_are_not_plain_integers():
@@ -188,9 +198,12 @@ def test_proc_environ_discards_uids_that_are_not_plain_integers():
     assert "2 distinct owning uids (0, 7)" in finding.evidence
 
 
-def test_proc_environ_survives_a_missing_uid_list():
+def test_proc_environ_survives_an_empty_uid_list():
+    """A scan that counted readable environments but recorded no owner still
+    reports the count. The exposure is the finding; the uids describe its
+    shape and their absence must not swallow it."""
     outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, foreign_environ_count=5, foreign_environ_uids="nonsense")))
+        _CLEAN, foreign_environ_count=5, foreign_environ_uids=[])))
     finding = next(f for f in outcome.findings if f.rule_key == "proc_environ")
     assert "5 process environments" in finding.evidence
     assert "unrecorded set of owning uids" in finding.evidence
@@ -540,63 +553,30 @@ def test_scan_finds_foreign_processes_that_a_pid_one_only_check_misses():
 
 
 # --- inner comes from the system under test, and both findings and errors
-# are written to an operator's terminal. Every path this probe reads out of
-# inner is cleaned of control characters and bounded in length and count
-# before it reaches either.
+# are written to an operator's terminal. Every path in this probe's report
+# is one the harness put into the payload itself, so a forged path is not
+# rendered at all rather than rendered safely. The cleaning still runs; the
+# provenance check is what a target cannot talk its way past.
 
 _FORGERY = "/etc/shadow\x1b[2J\x1b[H CONTAINED. Every probe ran, no findings."
 
 
-def test_a_forged_path_cannot_repaint_the_report():
+def test_a_forged_path_never_reaches_the_report_at_all():
+    """The forgery is a superstring of a real candidate, so a check that
+    compared loosely rather than by equality would still render it."""
     outcome = FilesystemProbe().run(_target(dict(_CLEAN, readable_outside=[_FORGERY])))
-    finding = next(f for f in outcome.findings if f.rule_key == "outside_workspace")
-    assert "\x1b" not in finding.evidence
-    assert "unprintable characters removed" in finding.evidence
+    assert outcome.findings == []
+    assert outcome.errors == []
 
 
-def test_an_enormous_path_is_truncated():
-    outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, listed_outside=["/" + "a" * 20000])))
-    finding = next(f for f in outcome.findings if f.rule_key == "outside_workspace")
-    assert len(finding.evidence) < 500
-    assert "truncated from 20001 characters" in finding.evidence
-
-
-def test_a_huge_path_list_is_bounded_and_the_remainder_is_counted():
-    outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, writable_outside=[f"/dir{n:05d}" for n in range(20000)])))
-    findings = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
-    assert len(findings) == LIST_LIMIT + 1
-    assert str(20000 - LIST_LIMIT) in findings[-1].evidence
-
-
-def test_a_huge_runtime_socket_list_is_bounded_and_the_remainder_is_counted():
-    outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, runtime_sockets=[f"/run/{n:05d}.sock" for n in range(100)])))
-    findings = [f for f in outcome.findings if f.rule_key == "runtime_socket"]
-    assert len(findings) == LIST_LIMIT + 1
-    assert str(100 - LIST_LIMIT) in findings[-1].evidence
-
-
-def test_a_forged_cleanup_path_cannot_repaint_the_report_through_an_error():
-    """Errors render to the same terminal findings do, so the same bound
-    applies to them."""
-    outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, writable_outside=["/etc"], cleanup_failed_outside=[_FORGERY])))
-    assert outcome.errors
-    assert "\x1b" not in outcome.errors[0].detail
-
-
-def test_a_huge_cleanup_list_is_bounded_and_the_remainder_is_counted():
-    outcome = FilesystemProbe().run(_target(dict(
-        _CLEAN, cleanup_failed_outside=[f"/dir{n:05d}" for n in range(100)])))
-    assert len(outcome.errors) == LIST_LIMIT + 1
-    assert str(100 - LIST_LIMIT) in outcome.errors[-1].detail
-
-
-def test_a_non_list_path_result_is_not_walked_character_by_character():
+def test_a_non_list_path_result_is_an_error_not_a_silent_absence():
+    """A bare string must not become one finding per character, and must not
+    be dropped in silence either: an empty result from the wrong shape reads
+    as an invariant that held."""
     outcome = FilesystemProbe().run(_target(dict(_CLEAN, readable_outside="/etc/shadow")))
     assert outcome.findings == []
+    assert outcome.errors
+    assert outcome.control_ok is False
 
 
 def test_a_forged_stderr_cannot_repaint_the_report_through_an_error():
@@ -624,3 +604,130 @@ def test_an_enormous_non_dict_inner_result_is_bounded():
     assert outcome.errors
     assert len(outcome.errors[0].detail) < 500
     assert not outcome.control_ok
+
+
+# --- The result's shape is checked before anything is read out of it. Every
+# measurement below is an inner.get with a falsy default, so a key that never
+# came back reads exactly like a key that came back negative.
+
+def test_an_empty_result_is_an_error_not_a_clean_verdict():
+    """Only the control key set used to produce zero findings, zero errors,
+    and a passing control."""
+    outcome = FilesystemProbe().run(_target({"workspace_writable": True}))
+    assert outcome.findings == []
+    assert outcome.errors
+    assert outcome.control_ok is False
+
+
+def test_a_count_sent_as_a_string_is_an_error_not_a_zero():
+    """The measured case: "218" reported zero foreign process environments."""
+    outcome = FilesystemProbe().run(_target(dict(_CLEAN, foreign_environ_count="218")))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "foreign_environ_count" in outcome.errors[0].detail
+    assert "proc_environ" not in _keys(outcome)
+
+
+def test_a_wrong_typed_uid_list_is_an_error_not_a_silent_absence():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, foreign_environ_count=5, foreign_environ_uids="nonsense")))
+    assert outcome.errors
+    assert outcome.control_ok is False
+
+
+def test_a_missing_workspace_control_key_is_an_error_not_an_unwritable_workspace():
+    inner = dict(_CLEAN)
+    del inner["workspace_writable"]
+    outcome = FilesystemProbe().run(_target(inner))
+    assert outcome.errors
+    assert outcome.control_ok is False
+    assert "workspace_writable is missing" in outcome.errors[0].detail
+
+
+# --- The candidate paths went in from here, so a path that did not is not an
+# answer to anything this probe asked. credentials.py and network.py both
+# compare against the harness's own list; this probe used to render whatever
+# came back, which let a target write up to LIST_LIMIT strings of its
+# choosing into each of four HIGH rule keys and bury one real finding under
+# sixty-four plausible fakes.
+
+def test_a_readable_path_the_probe_never_asked_about_is_not_reported():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, readable_outside=["/invented/path", _FORGERY])))
+    assert outcome.findings == []
+
+
+def test_a_listed_path_the_probe_never_asked_about_is_not_reported():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, listed_outside=["/invented", _FORGERY])))
+    assert outcome.findings == []
+
+
+def test_a_writable_path_the_probe_never_asked_about_is_not_reported():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, writable_outside=["/invented", _FORGERY])))
+    assert outcome.findings == []
+
+
+def test_a_runtime_socket_the_probe_never_asked_about_is_not_reported():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, runtime_sockets=["/invented.sock", _FORGERY])))
+    assert outcome.findings == []
+
+
+def test_a_cleanup_path_the_probe_never_asked_about_is_not_reported():
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, cleanup_failed_outside=["/invented", _FORGERY])))
+    assert outcome.errors == []
+
+
+def test_a_target_cannot_flood_the_report_with_forged_paths():
+    """Sixteen entries per list, four lists, sixty-four HIGH findings of the
+    target's own choosing. The intersection is what caps this at the number
+    of paths the harness actually asked about."""
+    flood = [f"/dir{n:05d}" for n in range(20000)]
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN,
+        readable_outside=flood,
+        listed_outside=flood,
+        writable_outside=flood,
+        runtime_sockets=flood,
+    )))
+    assert outcome.findings == []
+
+
+def test_paths_are_reported_in_the_harnesss_own_order():
+    """Order comes from the candidate list, not from the target, so a target
+    cannot choose which finding a reader sees first."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, writable_outside=["/usr", "/", "/etc"])))
+    reported = [f.evidence.split()[0] for f in outcome.findings
+                if f.rule_key == "outside_workspace"]
+    assert reported == list(_WRITABLE_CANDIDATES)
+
+
+def test_every_candidate_path_still_reports_when_the_target_names_it():
+    """The intersection must not quietly stop reporting real findings. Every
+    path the harness asks about is still reported when it comes back."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN,
+        readable_outside=list(_READABLE_CANDIDATES),
+        listed_outside=list(_LISTED_CANDIDATES),
+        writable_outside=list(_WRITABLE_CANDIDATES),
+        runtime_sockets=list(_SOCKET_CANDIDATES),
+    )))
+    outside = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
+    sockets = [f for f in outcome.findings if f.rule_key == "runtime_socket"]
+    assert len(outside) == (
+        len(_READABLE_CANDIDATES) + len(_LISTED_CANDIDATES) + len(_WRITABLE_CANDIDATES)
+    )
+    assert len(sockets) == len(_SOCKET_CANDIDATES)
+
+
+def test_the_payload_probes_exactly_the_candidate_paths_the_harness_checks():
+    """The intersection is only sound if both sides read from one list. A
+    path added to the payload and not to the candidate tuples would be
+    measured inside the sandbox and then silently discarded here."""
+    for candidate in (_READABLE_CANDIDATES + _LISTED_CANDIDATES
+                      + _WRITABLE_CANDIDATES + _SOCKET_CANDIDATES):
+        assert repr(candidate) in PAYLOAD_BODY, candidate
