@@ -578,6 +578,21 @@ outside the workspace to test writability, and request a reset if one is
 configured, all of which is intrusive enough that pointing it at someone
 else's infrastructure is not yours to do.
 
+## How this repository was built
+
+[zulusec/posture-reference](https://github.com/zulusec/posture-reference) was
+built through a pull request loop and documents that loop in its own README.
+This repository was not. Its history is commits pushed directly to `main`, with
+no pull requests, and CI recorded only on the pushes that reached GitHub rather
+than on every change.
+
+The work was reviewed, and what the review produced is visible in the code
+rather than in the history: the positive controls, the address-literal check
+described under Limitations, and the CI gate that fails a skipped end-to-end
+test all came out of it. But the record here is weaker than the record there.
+Anyone checking how ZuluSec builds things should read posture-reference for
+that, and read this repository for what it measures.
+
 ## Getting this built
 
 Designing and building containment like this is the
