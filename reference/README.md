@@ -21,8 +21,10 @@ Any traffic the sandbox wants to send outward has to pass through it, because
 there is no other path out.
 
 The sandbox is further restricted with `read_only: true`, a dropped
-capability set, `no-new-privileges`, a memory limit, and a process limit, and
-it runs as an unprivileged user (`10001:10001`). The broker runs under the
+capability set, `no-new-privileges`, a memory limit, a process limit, and a
+CPU quota, and it runs as an unprivileged user (`10001:10001`). The CPU
+setting is `cpus`, which writes a quota into the cgroup, rather than a share
+weight, which bounds nothing on an idle host. The broker runs under the
 same non-root user and the same read-only, no-new-privileges, capability-drop
 posture.
 

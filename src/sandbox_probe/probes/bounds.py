@@ -13,8 +13,17 @@ LONG_MAX rounded to a page boundary, roughly 9.2e18 on a 64-bit host)
 instead. Both are treated as uncapped; anything else, including 256 MiB
 worth of bytes, reads as capped because it sits far below that sentinel.
 
+CPU is read from the same place and in the same spirit, because a CPU
+ceiling is exactly as configurable and exactly as readable as a memory one.
+Cgroup v2 puts the quota and the period in cpu.max as two fields and writes
+the literal "max" in the quota field when none is set; cgroup v1 keeps the
+quota in cpu.cfs_quota_us and writes -1 there instead. Only the quota
+counts. cpu.weight (cpu.shares on v1) is a relative share of contended time
+rather than a ceiling, so a sandbox carrying a weight and no quota can still
+take every core on an idle host, and it is reported here as uncapped.
+
 There is no cgroup file for wall-clock time; cgroups bound memory, PIDs, and
-CPU shares, not elapsed real time. A wall-clock bound genuinely does not
+CPU bandwidth, not elapsed real time. A wall-clock bound genuinely does not
 live inside the sandbox: it lives in whatever invokes the task, an agent
 framework's task timeout, a Kubernetes activeDeadlineSeconds, a CI job
 timeout. That is not a gap in the invariant, it is a fact about where the
@@ -78,6 +87,7 @@ _CGROUP_MAX = "max"
 _RESULT_SHAPE = {
     "memory_capped": BOOL,
     "pids_capped": BOOL,
+    "cpu_capped": BOOL,
     "marker_present": BOOL,
 }
 
@@ -105,6 +115,25 @@ result['memory_capped'] = cgroup_capped(memory)
 
 pids = read_first(['/sys/fs/cgroup/pids.max', '/sys/fs/cgroup/pids/pids.max'])
 result['pids_capped'] = bool(pids and pids != {_CGROUP_MAX!r})
+
+def cpu_capped(value):
+    # cgroup v2 cpu.max is '<quota> <period>', carrying the literal 'max' in
+    # the quota field when none is set. cgroup v1 cpu.cfs_quota_us is -1
+    # then. Only a positive quota is a ceiling: cpu.weight and cpu.shares
+    # decide who wins a contended host and bound nothing on an idle one, so
+    # they are not read here at all.
+    parts = value.split() if value else []
+    if not parts or parts[0] == {_CGROUP_MAX!r}:
+        return False
+    try:
+        return int(parts[0]) > 0
+    except ValueError:
+        return False
+
+cpu = read_first(['/sys/fs/cgroup/cpu.max',
+                  '/sys/fs/cgroup/cpu/cpu.cfs_quota_us',
+                  '/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us'])
+result['cpu_capped'] = cpu_capped(cpu)
 
 marker = os.path.join(os.getcwd(), {_MARKER_NAME!r})
 result['marker_present'] = os.path.exists(marker)
@@ -179,6 +208,17 @@ class BoundsProbe:
                 evidence=(
                     "The sandbox cgroup reports no pids ceiling, so one task "
                     "can fork-bomb the host."
+                ),
+            ))
+        if not first.get("cpu_capped"):
+            findings.append(Finding(
+                probe_id=self.probe_id, subject=target.name,
+                rule_key="cpu_uncapped", severity=Severity.MEDIUM,
+                title="No CPU limit is configured",
+                evidence=(
+                    "The sandbox cgroup reports no CPU quota, so one task can "
+                    "take every core the host has. A share weight is not a "
+                    "ceiling and is not read as one."
                 ),
             ))
         if target.wallclock_limit_seconds is None:

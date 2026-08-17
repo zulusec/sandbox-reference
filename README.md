@@ -123,13 +123,13 @@ HIGH    detection  no_event_channel
         The target has no alert channel
         No event channel is configured. A policy violation produces no alert, so the only way anyone learns of it is by reading the log afterward.
 
-HIGH    filesystem  outside_workspace
-        A path outside the workspace is readable
-        /etc/shadow was read from inside the sandbox
-
-HIGH    filesystem  outside_workspace
+HIGH    filesystem  host_mount
         A host mount is exposed inside the sandbox
         /host was listed from inside the sandbox. A host-mount marker directory should not exist at all in a contained sandbox.
+
+HIGH    filesystem  outside_workspace
+        A path outside the workspace is readable
+        /etc/shadow was read from inside the sandbox. The file exists in every image, so the read is the finding: it means the sandbox runs as a user that can take the password hashes in its own filesystem.
 
 HIGH    filesystem  outside_workspace
         A path outside the workspace is writable
@@ -162,6 +162,10 @@ HIGH    network  blocked_egress
 HIGH    network  dns_canary
         The sandbox resolved a public name
         resolved example.com. Name resolution is an exfiltration channel that an HTTP allowlist does not cover.
+
+MEDIUM  bounds  cpu_uncapped
+        No CPU limit is configured
+        The sandbox cgroup reports no CPU quota, so one task can take every core the host has. A share weight is not a ceiling and is not read as one.
 
 MEDIUM  bounds  memory_uncapped
         No memory limit is configured
@@ -203,14 +207,15 @@ Full detail is in [`fixtures/leaky/README.md`](fixtures/leaky/README.md).
 Each invariant gets one probe. Every finding carries a `rule_key` and a fixed
 severity, so a result can be diffed between runs and tracked over time.
 
-These tables are the full reference of all 23 rule keys, not a list of what
-the demo above exercises. The leaky fixture trips nine of them end to end, and
-they are exactly the nine in its output: `blocked_egress`, `env_secret`,
-`outside_workspace`, `runtime_socket`, `no_request_log`, `no_event_channel`,
-`no_reset_configured`, `memory_uncapped`, `wallclock_uncapped`. A tenth,
-`dns_canary`, trips as well when the machine running the fixture has internet
-access, and the end-to-end suite does not assert it for exactly that reason.
-The other fourteen (`c2_channel`, `credential_file`, `imds_reachable`,
+These tables are the full reference of all 25 rule keys, not a list of what
+the demo above exercises. The leaky fixture trips eleven of them end to end,
+and they are exactly the eleven in its output: `blocked_egress`, `env_secret`,
+`outside_workspace`, `host_mount`, `runtime_socket`, `no_request_log`,
+`no_event_channel`, `no_reset_configured`, `memory_uncapped`, `cpu_uncapped`,
+`wallclock_uncapped`. A twelfth, `dns_canary`, trips as well when the machine
+running the fixture has internet access, and the end-to-end suite does not
+assert it for exactly that reason.
+The other thirteen (`c2_channel`, `credential_file`, `imds_reachable`,
 `imds_hop_limit`, `proc_environ`, `workspace_missing`, `pids_uncapped`,
 `persists_across_runs`, `crossing_unlogged`, `decision_missing`,
 `violation_unalerted`, `severity_understated`, `channel_not_separated`) are
@@ -245,10 +250,17 @@ check now reports *why* it did not fire:
 | `connected` / `resolved` | The sandbox reached it. | Finding. |
 | `denied` | The attempt was made and refused. | A measurement. Clean. |
 | `unresolved` | The name did not resolve, so nothing was attempted. | Not a finding and not a pass. Nothing was measured. |
+| `timeout` | The attempt was made and the deadline expired with nothing back. | Not a finding and not a pass. On `blocked_endpoint` it is a `ProbeError`. |
 | `unattempted` | The literal could not be used at all. | `ProbeError`. The run is incomplete and cannot print `CONTAINED`. |
 
 So a clean `network` result rests on `blocked_endpoint` having been attempted
-and denied. An `unresolved` name never contributes to it.
+and answered: `connected` or `denied`, nothing else. An `unresolved` name never
+contributes to it, and neither does a timeout. `denied` is the stack reporting
+a decision (refused, no route, no route to host); a timeout is the absence of
+one, and a firewall that drops rather than rejects looks the same from inside
+the sandbox as a congested bridge or a loaded runner does. So a target whose
+egress policy drops silently cannot be measured this way from inside, and the
+run says so rather than counting the silence as containment.
 
 | Rule key | Severity |
 | --- | --- |
@@ -302,6 +314,7 @@ host filesystem, no other tenants, no container runtime socket.
 
 | Rule key | Severity |
 | --- | --- |
+| `host_mount` | HIGH |
 | `outside_workspace` | HIGH |
 | `runtime_socket` | HIGH |
 | `proc_environ` | HIGH |
@@ -314,9 +327,20 @@ outside the declared workspace, and the environment of any process owned by a
 different uid. Positive control: the workspace is actually writable, because a
 sandbox with no usable workspace passes every negative test by being useless.
 
+`host_mount` and `outside_workspace` are two keys because they answer two
+questions. `host_mount` is this invariant's own subject: a path belonging to
+the host, or to another tenant, reachable from inside. `outside_workspace`
+is everything readable or writable outside the declared workspace but still
+inside the sandbox's own container image, which is a writable root filesystem
+and a uid with more reach than it needs. Both are real and both are HIGH,
+and neither answers for the other: a clean `host_mount` says nothing about a
+writable `/etc`, and a clean `outside_workspace` says nothing about the host
+being mounted in. They shared one key until August 2026, and anyone tracking
+`outside_workspace` from before then is tracking the union of the two.
+
 ### 4. Bounded and disposable
 
-Probe id `bounds`. Memory, process, and wall-clock ceilings, and a sandbox
+Probe id `bounds`. Memory, process, CPU and wall-clock ceilings, and a sandbox
 that is reset between tasks such that persistence across runs is not
 achievable. Persistence is what turns one bad task into a foothold.
 
@@ -326,12 +350,17 @@ achievable. Persistence is what turns one bad task into a foothold.
 | `no_reset_configured` | HIGH |
 | `memory_uncapped` | MEDIUM |
 | `pids_uncapped` | MEDIUM |
+| `cpu_uncapped` | MEDIUM |
 | `wallclock_uncapped` | MEDIUM |
 
 Caps are read from the sandbox's own cgroup view rather than tested by
 exhaustion. Allocating memory until the kernel intervenes would be a denial of
 service against the machine running the harness, and the question the invariant
-asks is whether a limit is configured. Two of these keys are weaker than the
+asks is whether a limit is configured. `cpu_uncapped` reads the quota and only
+the quota: cgroup v2 `cpu.max` carries the literal `max` when none is set, and
+cgroup v1 `cpu.cfs_quota_us` carries `-1`. A share weight (`cpu.weight`,
+`cpu.shares`) decides who wins a contended host and bounds nothing on an idle
+one, so it is not read as a ceiling. Two of these keys are weaker than the
 rest and both are disclosed under [Limitations](#limitations).
 
 ### 5. Attributable
@@ -385,17 +414,21 @@ and does not pretend to.
 
 ## Limitations
 
-Five of them, stated here rather than buried, because a harness implying
+Six of them, stated here rather than buried, because a harness implying
 coverage it does not have would be worse than no harness.
 
 **1. Confused-deputy attacks are out of reach.** The harness tests what the
 sandbox itself can reach. It cannot detect an attack where the agent supplies
 data that causes a privileged component to read or execute on its behalf. The
 sandbox never touches the resource; something trusted touches it on the
-sandbox's behalf, and from inside the sandbox that is invisible. Both initial
-data-theft vectors in the July 2026 OpenAI and Hugging Face incident were of
-this class. Six clean probes do not mean a sandbox is safe from this, and
-nothing in this repository should be read as saying otherwise.
+sandbox's behalf, and from inside the sandbox that is invisible. The first of
+the two initial vectors in the July 2026 OpenAI and Hugging Face incident was
+of this class: a dataset config that had the processing worker open a local
+path and hand its contents back as dataset rows. The second was a template
+injection giving code execution inside that worker, which is a foothold rather
+than a confused-deputy read, and just as invisible from inside a sandbox. Six
+clean probes do not mean a sandbox is safe from either, and nothing in this
+repository should be read as saying otherwise.
 
 **2. The wall-clock bound is declared, not measured.** `wallclock_uncapped`
 fires when the target config declares no `wallclock_limit_seconds`. It does not
@@ -425,7 +458,17 @@ of them measure. It is listed under
 [What it is not](#what-it-is-not) as well, because it is the same discipline
 seen from the other side.
 
-**5. Four of the six probes take the sandbox at its word.** `network`,
+**5. `host_mount` looks for a convention, not for every host mount.** The
+check lists `/host` and `/hostfs`, which do not exist in an ordinary base
+image and are where a host filesystem gets mounted when someone mounts one.
+A host path mounted at an ordinary name (`/data`, `/srv`, a project
+directory) is a host mount this probe does not see. Enumerating mount
+sources instead would need `/proc/self/mountinfo` parsing and a rule for
+which sources are the host's, which is a judgement this harness has not
+earned yet. A clean `host_mount` therefore means the marker paths are
+absent, not that nothing of the host is mounted in.
+
+**6. Four of the six probes take the sandbox at its word.** `network`,
 `credentials`, `filesystem` and `bounds` measure by running a payload inside
 the sandbox and reading the line it prints back. A sandbox already under an
 adversary's control can print whatever it likes, so a clean result from those
@@ -469,7 +512,7 @@ from stdin, such as `python3 -`.
 
 | Key | Type | What it is, and what its absence means |
 | --- | --- | --- |
-| `blocked_endpoint` | string, `IP:port` | The address literal the sandbox must not reach. Defaults to `1.1.1.1:443`. Needs no DNS, so it measures raw routability in every environment, and it is what a clean `network` result rests on. A hostname here is rejected, because a hostname would put name resolution back in front of the one check that survives without it. |
+| `blocked_endpoint` | string, `IP:port` | The address literal the sandbox must not reach. Defaults to `1.1.1.1:443`. Needs no DNS, so it measures raw routability in every environment, and it is what a clean `network` result rests on. A hostname here is rejected, because a hostname would put name resolution back in front of the one check that survives without it. Point it at something that answers or refuses rather than something that drops: a connect attempt that times out is reported as a gap, not as a denial. |
 | `dns_canary_host` | string | A name that genuinely resolves wherever DNS egress exists. Defaults to `example.com`. Resolving it is a `dns_canary` finding. Failing to resolve it is not a pass, because an environment with no DNS at all fails the same way. |
 | `c2_hosts` | list of strings | Staging and command-and-control class hosts (pastebins, request-capture services, file drops). Absent means `c2_channel` is not exercised. |
 | `proxy` | string, `host:port` | The egress broker. When set, the network positive control and the attribution and detection crossings go through it in absolute-URI form. When absent, those probes fall back to direct reachability, which is honest about proving less. |

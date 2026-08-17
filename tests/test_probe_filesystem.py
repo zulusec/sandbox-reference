@@ -67,14 +67,28 @@ def test_readable_host_path_is_a_finding():
     assert "read" in finding.evidence.lower()
 
 
-def test_listed_host_mount_is_a_finding():
-    """A listable /host or /hostfs means the host filesystem is mounted in,
-    which is a distinct signal from an ordinary writable or readable path."""
+def test_listed_host_mount_is_its_own_rule_key():
+    """A listable /host or /hostfs means the host filesystem is mounted in.
+    That is invariant 3's own subject, and it is a different question from
+    a readable or writable path inside the sandbox's own image, so it is a
+    different key: a client tracking host_mount over time must not have a
+    writable /etc quietly answering for it, or the reverse."""
     outcome = FilesystemProbe().run(_target(dict(_CLEAN, listed_outside=["/host"])))
-    assert "outside_workspace" in _keys(outcome)
-    finding = next(f for f in outcome.findings if f.rule_key == "outside_workspace")
+    assert _keys(outcome) == {"host_mount"}
+    finding = next(f for f in outcome.findings if f.rule_key == "host_mount")
+    assert finding.severity.value == "HIGH"
     assert "/host" in finding.evidence
     assert "listed" in finding.evidence.lower()
+
+
+def test_a_container_local_path_never_reports_as_a_host_mount():
+    """The other direction of the same split. /etc and /etc/shadow are
+    inside the container's own image, so they are hardening findings and
+    must never trip the key that means the host filesystem is exposed."""
+    outcome = FilesystemProbe().run(_target(dict(
+        _CLEAN, readable_outside=["/etc/shadow"], writable_outside=["/etc"])))
+    assert "host_mount" not in _keys(outcome)
+    assert _keys(outcome) == {"outside_workspace"}
 
 
 def test_writable_outside_path_is_a_finding():
@@ -87,15 +101,17 @@ def test_writable_outside_path_is_a_finding():
     assert "writ" in finding.evidence.lower()
 
 
-def test_each_outside_workspace_signal_is_reported_separately():
+def test_each_path_signal_is_reported_separately_under_its_own_key():
     outcome = FilesystemProbe().run(_target(dict(
         _CLEAN,
         readable_outside=["/etc/shadow"],
         listed_outside=["/host"],
         writable_outside=["/etc", "/usr"],
     )))
-    findings = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
-    assert len(findings) == 4
+    outside = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
+    mounts = [f for f in outcome.findings if f.rule_key == "host_mount"]
+    assert len(outside) == 3
+    assert len(mounts) == 1
 
 
 def test_proc_environ_is_a_finding():
@@ -717,10 +733,10 @@ def test_every_candidate_path_still_reports_when_the_target_names_it():
         runtime_sockets=list(_SOCKET_CANDIDATES),
     )))
     outside = [f for f in outcome.findings if f.rule_key == "outside_workspace"]
+    mounts = [f for f in outcome.findings if f.rule_key == "host_mount"]
     sockets = [f for f in outcome.findings if f.rule_key == "runtime_socket"]
-    assert len(outside) == (
-        len(_READABLE_CANDIDATES) + len(_LISTED_CANDIDATES) + len(_WRITABLE_CANDIDATES)
-    )
+    assert len(outside) == len(_READABLE_CANDIDATES) + len(_WRITABLE_CANDIDATES)
+    assert len(mounts) == len(_LISTED_CANDIDATES)
     assert len(sockets) == len(_SOCKET_CANDIDATES)
 
 

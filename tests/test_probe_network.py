@@ -82,6 +82,19 @@ def test_an_unattempted_address_literal_is_an_error_not_a_pass():
     assert outcome.findings == []
 
 
+def test_a_timed_out_address_literal_is_an_error_not_a_denied_route():
+    """A deadline that expired is the absence of an answer, not a refusal.
+    A firewall that drops rather than rejects produces it, and so does a
+    congested bridge, so the run says it could not establish routability
+    instead of counting it toward containment."""
+    outcome = NetworkProbe().run(_target(_inner(blocked_endpoint="timeout")))
+    assert outcome.errors
+    assert outcome.errors[0].operation == "blocked_endpoint"
+    assert "timed out" in outcome.errors[0].detail
+    assert "1.1.1.1:443" in outcome.errors[0].detail
+    assert outcome.findings == []
+
+
 def test_a_missing_address_literal_result_is_an_error_not_a_pass():
     inner = _inner()
     del inner["blocked_endpoint"]
@@ -141,6 +154,17 @@ def test_an_unresolved_blocked_host_is_not_a_finding_and_not_an_error():
     answered the question this one would have asked, and it answered it
     without DNS. Remove that check and this branch becomes the hole again."""
     outcome = NetworkProbe().run(_target(_inner(blocked_host="unresolved")))
+    assert outcome.findings == []
+    assert outcome.errors == []
+
+
+def test_a_timed_out_name_check_is_neither_a_finding_nor_an_error():
+    """Same rule as unresolved, one layer down: nothing was measured here,
+    and the containment claim does not rest on it either way. It is not an
+    error only because the address literal answered the routability
+    question without a name in it."""
+    outcome = NetworkProbe().run(_target(_inner(
+        blocked_host="timeout", c2={"paste.invalid": "timeout"})))
     assert outcome.findings == []
     assert outcome.errors == []
 
@@ -383,6 +407,53 @@ def _closed_port() -> int:
     port = probe.getsockname()[1]
     probe.close()  # nothing listens here now: the connection is refused
     return port
+
+
+class _RaisingSocket:
+    """Just enough of the socket module for the payload's reachable().
+
+    A real connect timeout cannot be produced deterministically from a unit
+    test: every address that reliably blackholes packets depends on the
+    network the suite happens to be run on, and an address that refuses is
+    a different measurement entirely. The exception the standard library
+    raises is the thing under test, so it is raised directly.
+    """
+
+    gaierror = socket.gaierror
+
+    def __init__(self, error):
+        self._error = error
+
+    def create_connection(self, *args, **kwargs):
+        raise self._error
+
+
+def test_a_connect_deadline_is_an_oserror_which_is_why_the_order_matters():
+    """The relation the branch ordering rests on, asserted rather than
+    remembered. socket.timeout has been an alias of TimeoutError since
+    Python 3.10, and TimeoutError is an OSError, so catching OSError first
+    swallows it."""
+    assert socket.timeout is TimeoutError
+    assert issubclass(socket.timeout, OSError)
+    assert issubclass(socket.gaierror, OSError)
+
+
+def test_reachable_separates_a_timed_out_route_from_a_refused_one():
+    """The defect this state exists for. ECONNREFUSED, ENETUNREACH and
+    EHOSTUNREACH are the stack reporting a decision; a deadline that
+    expired is the absence of one. Reporting both as 'denied' means a
+    congested bridge and an enforced boundary produce the same clean
+    network result."""
+    functions = _load_payload_functions()
+    functions["socket"] = _RaisingSocket(TimeoutError("timed out"))
+    assert functions["reachable"]("192.0.2.1", 443) == "timeout"
+    assert functions["endpoint_status"]("192.0.2.1:443") == "timeout"
+    functions["socket"] = _RaisingSocket(ConnectionRefusedError())
+    assert functions["reachable"]("192.0.2.1", 443) == "denied"
+    functions["socket"] = _RaisingSocket(OSError("network is unreachable"))
+    assert functions["reachable"]("192.0.2.1", 443) == "denied"
+    functions["socket"] = _RaisingSocket(socket.gaierror())
+    assert functions["reachable"]("nothing-here.invalid", 80) == "unresolved"
 
 
 def test_reachable_separates_a_denied_route_from_a_name_that_does_not_exist():

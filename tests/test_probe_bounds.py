@@ -47,8 +47,8 @@ def _keys(outcome):
 # measurement rather than an assumption. The first exec writes the marker and
 # says whether the write succeeded; without that key, a workspace that
 # refused the write is indistinguishable from a sandbox that disposed of it.
-_BOUNDED = {"memory_capped": True, "pids_capped": True, "marker_present": False,
-            "marker_written": True, "marker_removed": True}
+_BOUNDED = {"memory_capped": True, "pids_capped": True, "cpu_capped": True,
+            "marker_present": False, "marker_written": True, "marker_removed": True}
 
 
 def test_bounded_and_disposable_sandbox_is_clean():
@@ -66,6 +66,11 @@ def test_uncapped_memory_is_a_finding():
 def test_uncapped_pids_is_a_finding():
     inner = dict(_BOUNDED, pids_capped=False)
     assert "pids_uncapped" in _keys(BoundsProbe().run(_target([inner, inner])))
+
+
+def test_uncapped_cpu_is_a_finding():
+    inner = dict(_BOUNDED, cpu_capped=False)
+    assert "cpu_uncapped" in _keys(BoundsProbe().run(_target([inner, inner])))
 
 
 def test_declared_wallclock_limit_avoids_the_finding():
@@ -170,6 +175,63 @@ def test_a_failed_marker_write_is_never_a_clean_disposability_result():
     outcome = BoundsProbe().run(_target([dict(_BOUNDED, marker_written=False), _BOUNDED]))
     assert outcome.control_ok is False
     assert outcome.errors
+
+
+# --- The CPU ceiling, read the same way the memory one is.
+#
+# A cap the site claims and the harness does not read is a claim nobody can
+# check, which is the one failure this project cannot afford. cpu.max is
+# readable from inside a container in exactly the way memory.max is, so
+# there is no reason for CPU to be the asserted member of the list.
+
+
+def _payload_namespace() -> dict:
+    """The payload's own function definitions, in the namespace emit() gives
+    them.
+
+    The payload is one source string piped into an interpreter inside the
+    target, so exercising its parsing here means exec'ing it. Its marker
+    block writes to the working directory, so this runs in a temporary one
+    and leaves nothing behind.
+    """
+    namespace: dict = {"os": os, "result": {}}
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory() as workspace:
+        os.chdir(workspace)
+        try:
+            exec(PAYLOAD_BODY, namespace)  # noqa: S102 -- the payload's own source
+        finally:
+            os.chdir(previous)
+    return namespace
+
+
+def test_cpu_capped_reads_the_quota_and_not_the_share():
+    """Both cgroup v2 strings below came out of a real container: one run
+    with `--cpus 0.5`, one run with no CPU limit at all. The v1 pair is
+    cpu.cfs_quota_us, which is -1 when nothing is configured.
+
+    A share weight is deliberately not consulted. cpu.weight decides who
+    wins a contended host and bounds nothing on an idle one, so reading it
+    as a ceiling would report a cap that does not exist.
+    """
+    cpu_capped = _payload_namespace()["cpu_capped"]
+    assert cpu_capped("50000 100000") is True
+    assert cpu_capped("max 100000") is False
+    assert cpu_capped("100000") is True
+    assert cpu_capped("-1") is False
+    assert cpu_capped("0") is False
+    assert cpu_capped(None) is False
+    assert cpu_capped("") is False
+    assert cpu_capped("   ") is False
+    assert cpu_capped("nonsense") is False
+
+
+def test_the_payload_reads_a_cpu_answer_out_of_this_machines_cgroup():
+    """Whatever this host reports, the key has to arrive. A missing one is
+    read with a falsy default further up, so a payload that stopped
+    answering would look like an uncapped sandbox rather than an
+    unanswered question."""
+    assert isinstance(_payload_namespace()["result"]["cpu_capped"], bool)
 
 
 # --- Errors render to the same terminal findings do, and the target chooses

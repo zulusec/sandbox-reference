@@ -3,9 +3,18 @@
 Four questions, not one, and the first one is the one that cannot be
 dodged. Can the sandbox open a TCP connection to a bare address literal.
 That question needs no name resolution, so there is no state of the world in
-which it silently fails to run: either the connection opened, or the route
-was denied, and both of those are measurements. It is the check that carries
-this invariant.
+which it silently fails to run: either the connection opened, or the stack
+answered that it was refused or unroutable, and both of those are
+measurements. It is the check that carries this invariant.
+
+A deadline that expires with nothing coming back is neither of those, and
+it gets its own state rather than being folded into a denial. A firewall
+that drops instead of rejecting, a loaded runner and a congested bridge all
+produce the same silence from inside the sandbox, so a timeout says the
+route was not established, never that it was refused. The reason
+reachable() reports four states rather than two is that collapsing "no
+answer" into "denied" is how a harness certifies an uncontained sandbox,
+and a timeout is that collapse wearing a different error class.
 
 The other three are name-based, and every name-based check has a failure
 mode the first one does not. Can the sandbox reach a host it should not, can
@@ -53,8 +62,10 @@ from sandbox_probe.target import ExecResult, Target
 
 _TIMEOUT = 60
 
-# The two answers the address-literal check is allowed to give. Anything
-# else means it did not run.
+# The two answers that settle the address-literal question. 'timeout' means
+# the attempt was made and nothing came back, and everything else means the
+# check never ran at all. Both are errors, with different details, because
+# neither is an answer about routability.
 _MEASURED = ("connected", "denied")
 
 # What the payload has to answer, and in what shape. Every measurement below
@@ -80,19 +91,30 @@ _RESULT_SHAPE = {
 
 PAYLOAD_BODY = """
 def reachable(host, port=80, timeout=3):
-    # Three answers, not two. The old two-answer version caught OSError and
-    # returned False, which made 'the name does not exist' and 'the route
-    # was denied' the same answer. Only the second one is a measurement of
-    # containment, and collapsing them is how a harness certifies a sandbox
-    # with unrestricted egress as contained: every name it was told to try
-    # happened to be one that resolves for nobody.
+    # Four answers, not two. The original two-answer version caught OSError
+    # and returned False, which made 'the name does not exist' and 'the
+    # route was denied' the same answer. Only the second one is a
+    # measurement of containment, and collapsing them is how a harness
+    # certifies a sandbox with unrestricted egress as contained: every name
+    # it was told to try happened to be one that resolves for nobody.
     #
-    # socket.gaierror is a subclass of OSError, so it has to be caught first.
+    # 'timeout' is the same argument applied to the same line from the
+    # other side. ECONNREFUSED, ENETUNREACH and EHOSTUNREACH are the stack
+    # reporting a decision; a deadline that expired is the absence of one,
+    # and a dropping firewall, a loaded runner and a congested bridge are
+    # indistinguishable from here. So it is reported as its own state and
+    # never counted as a denial.
+    #
+    # socket.gaierror and socket.timeout are both OSError subclasses
+    # (socket.timeout has been an alias of the builtin TimeoutError since
+    # Python 3.10), so both have to be caught ahead of it.
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return 'connected'
     except socket.gaierror:
         return 'unresolved'
+    except TimeoutError:
+        return 'timeout'
     except OSError:
         return 'denied'
 
@@ -270,8 +292,9 @@ class NetworkProbe:
 
         # The address literal, first, because it is the check the rest of
         # this probe leans on. It needs no DNS, so 'connected' means the
-        # sandbox has a route off its own network and 'denied' means it does
-        # not, and there is no third state that quietly means neither.
+        # sandbox has a route off its own network and 'denied' means the
+        # stack said otherwise. 'timeout' is neither, and it is reported as
+        # a gap rather than quietly counted as the second one.
         endpoint_status = inner.get("blocked_endpoint")
         if endpoint_status == "connected":
             findings.append(Finding(
@@ -284,6 +307,15 @@ class NetworkProbe:
                     "the allowlist says."
                 ),
             ))
+        elif endpoint_status == "timeout":
+            errors.append(ProbeError(
+                self.probe_id, target.name, "blocked_endpoint",
+                f"the address-literal reachability check timed out against "
+                f"{target.blocked_endpoint}. A firewall that drops rather than "
+                "rejects, a loaded host and a congested path all look like this "
+                "from inside the sandbox, so nothing was established about raw "
+                "routability and this run cannot report the network clean.",
+            ))
         elif endpoint_status not in _MEASURED:
             errors.append(ProbeError(
                 self.probe_id, target.name, "blocked_endpoint",
@@ -293,12 +325,13 @@ class NetworkProbe:
                 "so nothing else here adds up to a containment result.",
             ))
 
-        # The name-based reach check. 'unresolved' is not a pass and is not
-        # counted as one: it is a check that measured nothing, and the only
-        # reason it is not an error is that blocked_endpoint above asked the
-        # same question without a name in it and got an answer. Delete that
-        # check and this branch becomes the hole that let a sandbox with
-        # unrestricted egress and working public DNS report CONTAINED.
+        # The name-based reach check. 'unresolved' and 'timeout' are not
+        # passes and are not counted as ones: each is a check that measured
+        # nothing, and the only reason neither is an error is that
+        # blocked_endpoint above asked the same question without a name in
+        # it and got an answer. Delete that check and this branch becomes
+        # the hole that let a sandbox with unrestricted egress and working
+        # public DNS report CONTAINED.
         if inner.get("blocked_host") == "connected":
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name, rule_key="blocked_egress",

@@ -50,6 +50,7 @@ _LEAK_PAIRS = [
     ("network", "blocked_egress"),
     ("credentials", "env_secret"),
     ("filesystem", "outside_workspace"),
+    ("filesystem", "host_mount"),
     ("filesystem", "runtime_socket"),
     ("attribution", "no_request_log"),
     ("detection", "no_event_channel"),
@@ -187,9 +188,9 @@ def test_findings_surface_is_identical_across_two_separate_invocations(
 
     Run against the leaky fixture on purpose. The reference's findings
     surface is empty, and comparing one empty list to another would assert
-    nothing at all. Fifteen findings, their order, their severities and
-    their evidence strings all have to come back the same from a second
-    process for this to hold.
+    nothing at all. Every finding, their order, their severities and their
+    evidence strings all have to come back the same from a second process
+    for this to hold.
 
     Only the findings block is compared. Run metadata legitimately varies
     between runs and is excluded by the project's determinism contract.

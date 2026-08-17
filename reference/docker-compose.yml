@@ -63,6 +63,12 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     pids_limit: 128
+    # A quota, not a share. cpu.weight only decides who wins when the host is
+    # already contended, so a sandbox carrying a weight and no quota takes
+    # every core there is the moment the host is idle. The probe reads the
+    # quota out of cpu.max for that reason, and this is the setting that puts
+    # one there.
+    cpus: 1.0
     # Disposable means killable. The command here does not handle SIGTERM,
     # so without this every stop waits out the full default grace period of
     # ten seconds and then ends in a kill anyway: ten seconds of cost, the

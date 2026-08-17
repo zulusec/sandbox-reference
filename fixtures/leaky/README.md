@@ -24,9 +24,12 @@ some real deployment ships by default anyway.
   fails. Both values are obviously fake: the AWS key uses the AWS
   documentation example prefix (`AKIAIOSFODNN7EXAMPLE`), and the password
   is a well-known non-secret.
-- No `mem_limit`, no `pids_limit`. Invariant 4 (bounded resource
-  consumption) fails: nothing stops the sandbox from exhausting host memory
-  or forking until the process table is full.
+- No `mem_limit`, no `pids_limit`, no `cpus`. Invariant 4 (bounded resource
+  consumption) fails: nothing stops the sandbox from exhausting host memory,
+  forking until the process table is full, or taking every core on the box.
+  `pids_uncapped` is the one that does not trip here, because the container
+  reads back a Docker daemon default it was never configured with; the main
+  README's third limitation covers why.
 - No `user`, no `cap_drop`, no `read_only`. The container runs as root with
   its full default capability set on a writable filesystem. Invariants 2
   and 3 fail together: an escape from this container is an escape as root.

@@ -4,12 +4,28 @@ An explicitly mounted workspace and nothing else. The positive control here
 is that the workspace is actually writable, because a sandbox with no usable
 workspace passes every negative test by being useless.
 
+Two rule keys carry the path findings, and they are separate because they
+answer different questions and a client tracks them separately over time.
+host_mount is the invariant's own subject: the host filesystem, or another
+tenant's, reachable from inside. outside_workspace is everything the
+sandbox can read or write outside its declared workspace but still inside
+its own container image, which is a hardening result rather than a host
+exposure. Both are HIGH and neither substitutes for the other: a clean
+host_mount says nothing about a writable root filesystem, and a clean
+outside_workspace says nothing about a host path being mounted in. Keeping
+them under one key made the second read as the first, and the key is what
+survives into a client's history after the evidence string has scrolled
+away.
+
 Candidate paths (each a genuine containment-failure signal, not an artifact
 of an ordinary Linux filesystem):
 
-- /host, /hostfs: host-mount markers. These do not exist in a normal base
-  image; their presence, checked by directory listing, means someone
-  mounted the host filesystem in.
+- /host, /hostfs: host-mount markers, reported under host_mount. These do
+  not exist in a normal base image; their presence, checked by directory
+  listing, means someone mounted the host filesystem in. It is a
+  convention check and it says so: a host path mounted somewhere with an
+  ordinary name is a host mount this probe does not see, which is stated
+  as a limitation in the README rather than left for a reader to discover.
 - /etc/shadow: checked as a content read (open and read a byte), not a stat
   or an existence check. The file exists in every image; being able to read
   it is the finding.
@@ -398,12 +414,17 @@ class FilesystemProbe:
                 probe_id=self.probe_id, subject=target.name,
                 rule_key="outside_workspace", severity=Severity.HIGH,
                 title="A path outside the workspace is readable",
-                evidence=f"{path} was read from inside the sandbox",
+                evidence=(
+                    f"{path} was read from inside the sandbox. The file exists in "
+                    "every image, so the read is the finding: it means the sandbox "
+                    "runs as a user that can take the password hashes in its own "
+                    "filesystem."
+                ),
             ))
         for path in _confirmed(inner["listed_outside"], _LISTED_CANDIDATES):
             findings.append(Finding(
                 probe_id=self.probe_id, subject=target.name,
-                rule_key="outside_workspace", severity=Severity.HIGH,
+                rule_key="host_mount", severity=Severity.HIGH,
                 title="A host mount is exposed inside the sandbox",
                 evidence=(
                     f"{path} was listed from inside the sandbox. A host-mount "
